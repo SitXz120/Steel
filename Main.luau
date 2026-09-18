@@ -1,9 +1,11 @@
+if game.PlaceId ~= 107778070777162 then return end
+
 if not game:IsLoaded() then
     game.Loaded:Wait()
 end
 
 -- EGG ATLAS | Steal An Egg | 2026-09-14
-local SCRIPT_VERSION="11.30.0"
+local SCRIPT_VERSION="11.30.1"
 local UI=...
 assert(type(UI)=="table" and UI.ApiVersion==1 and UI.Version==SCRIPT_VERSION,
     "UI module missing or incompatible. Run Loader.luau or the standalone EggAtlas.luau.")
@@ -17,7 +19,6 @@ while not player do
     Players:GetPropertyChangedSignal("LocalPlayer"):Wait()
     player=Players.LocalPlayer
 end
-assert(game.PlaceId == 107778070777162, "EGG ATLAS is for Steal An Egg.")
 local function beginAtlasLaunch(environment,job,version,now,hasUI)
     local previous=environment.EggAtlasLaunch
     if previous and previous.job==job and previous.version==version then
@@ -2552,7 +2553,7 @@ local function createBossHop(report)
             gui:SetAttribute("BossHopAttempts",state.attempts)
             assert(save(),"Could not save the server-search state")
             if not queued then
-                local bootstrap="if not game:IsLoaded() then game.Loaded:Wait() end; local env=getgenv(); if env.EggAtlasAutoLaunchJob~=game.JobId then local f,e=loadstring(readfile("..string.format("%q",sourcePath)..")); assert(f,e); env.EggAtlasAutoLaunchJob=game.JobId; local ok,err=pcall(f); if not ok then env.EggAtlasAutoLaunchJob=nil; local ticket=env.EggAtlasLaunch; if ticket and ticket.job==game.JobId and ticket.loading then env.EggAtlasLaunch=nil end; warn('EGG_ATLAS_RESUME_ERROR',err) end end"
+                local bootstrap="if game.PlaceId ~= 107778070777162 then return end; if not game:IsLoaded() then game.Loaded:Wait() end; local env=getgenv(); if env.EggAtlasAutoLaunchJob~=game.JobId then local f,e=loadstring(readfile("..string.format("%q",sourcePath)..")); assert(f,e); env.EggAtlasAutoLaunchJob=game.JobId; local ok,err=pcall(f); if not ok then env.EggAtlasAutoLaunchJob=nil; local ticket=env.EggAtlasLaunch; if ticket and ticket.job==game.JobId and ticket.loading then env.EggAtlasLaunch=nil end; warn('EGG_ATLAS_RESUME_ERROR',err) end end"
                 queue(bootstrap);queued=true
             end
             if cancelled() or not api.pending() then return end

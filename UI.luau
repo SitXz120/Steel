@@ -1,6 +1,6 @@
 -- Egg Atlas UI. Loading this file returns factories without creating a window.
 -- All runtime data and actions are supplied explicitly by Main.luau.
-local UI={ApiVersion=1,Version="11.30.0"}
+local UI={ApiVersion=1,Version="11.30.1"}
 local C = {
     bg = Color3.fromRGB(17, 16, 25), side = Color3.fromRGB(26, 24, 38),
     card = Color3.fromRGB(39, 35, 53), edge = Color3.fromRGB(86, 76, 112),
