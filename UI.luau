@@ -1,6 +1,6 @@
 -- Egg Atlas UI. Loading this file returns factories without creating a window.
 -- All runtime data and actions are supplied explicitly by Main.luau.
-local UI={ApiVersion=1,Version="11.30.1"}
+local UI={ApiVersion=1,Version="11.31.0"}
 local C = {
     bg = Color3.fromRGB(17, 16, 25), side = Color3.fromRGB(26, 24, 38),
     card = Color3.fromRGB(39, 35, 53), edge = Color3.fromRGB(86, 76, 112),
@@ -86,7 +86,7 @@ local function areaButton(id, title, subtitle, rank, color)
         ctx.onSelect(id)
     end)
 end
-areaButton("All", "All areas", "Collectible eggs only", 0, C.mint)
+areaButton("All", "All areas", "Field eggs + held by rivals", 0, C.mint)
 for _, a in ipairs(areaList) do
     areaButton(a.id, a.name, "Need " .. compact(a.requiredPower), a.rank, a.color)
 end
@@ -453,6 +453,7 @@ function UI.RenderAreas(ctx,resetScroll)
                     BackgroundColor3 = C.card, BorderSizePixel = 0, LayoutOrder = order,
                 }, eggScroll)
                 card:SetAttribute("AreaId", row.area)
+                card:SetAttribute("CarrierUserId",row.carrierId)
                 card:SetAttribute("Income", row.rate)
                 card:SetAttribute("PetRarity", row.rarity)
                 round(card, 10)
@@ -470,14 +471,14 @@ function UI.RenderAreas(ctx,resetScroll)
                 text(card, row.pet, 69, 10, 329, 23, 14, C.text, true)
                 local rarityLabel = text(card, "Rarity: " .. row.rarity, 69, 35, 329, 17, 11, row.rarityColor, true)
                 rarityLabel.Name = "PetRarity"
-                text(card, (row.state=="Dropped" and "DROPPED  /  " or "") .. row.nest .. "  /  " .. row.mutation, 69, 54, 329, 19, 10, C.muted)
+                text(card, (row.carrierId and ("HELD BY "..row.carrierName.."  /  ") or (row.state=="Dropped" and "DROPPED  /  " or "")) .. row.nest .. "  /  " .. row.mutation, 69, 54, 329, 19, 10, C.muted)
                 text(card, compact(row.weight) .. " kg", 414, 20, 100, 26, 12, C.text, true)
                 text(card, "$" .. compact(row.rate), 520, 19, 113, 28, 16, C.mint, true)
                 local picked=selectedTarget and selectedTarget.uid==row.uid and (runner.active or manualStarting)
                 local busy=runner.active or manualStarting
                 local automated=areaWatch.enabled or indexWatch.enabled or (riftController and (riftController.active or riftController.committing))
-                text(card,picked and "COLLECTING THIS PET" or (automated and "Pause automation for manual collection" or "Click to collect and return safely"),69,83,365,18,10,picked and C.mint or C.muted,picked)
-                local pick=button(card,picked and "COLLECTING" or (busy and "IN PROGRESS" or (automated and "AUTO ACTIVE" or "COLLECT  >")),454,80,173,24)
+                text(card,picked and "COLLECTING THIS PET" or (automated and "Pause automation for manual collection" or (row.carrierId and "Chase carrier, recover egg, return safely" or "Click to collect and return safely")),69,83,365,18,10,picked and C.mint or C.muted,picked)
+                local pick=button(card,picked and "COLLECTING" or (busy and "IN PROGRESS" or (automated and "AUTO ACTIVE" or (row.carrierId and "CHASE  >" or "COLLECT  >"))),454,80,173,24)
                 pick.Name="CollectEgg"
                 pick:SetAttribute("EggUid",row.uid)
                 pick.BackgroundColor3=(busy or automated) and C.edge or C.selected
@@ -501,54 +502,56 @@ function UI.RenderAreas(ctx,resetScroll)
 
 end
 
-function UI.CreateBossWidgets(page)
-    local purple=Color3.fromRGB(185,151,255)
-    text(page,"AUTO BOSS",22,16,630,33,25,purple,true)
-    text(page,"Set feature priority in Overview / finish the encounter before returning to other work",23,56,820,23,12,C.muted)
-    local sw=make("TextButton",{Name="BossAutoToggle",Text="",Position=UDim2.fromOffset(804,22),Size=UDim2.fromOffset(64,36),BackgroundColor3=Color3.fromRGB(67,76,91),BorderSizePixel=0,AutoButtonColor=false},page)
+function UI.CreateEventWidgets(page)
+    text(page,"DR SCRAMBLE'S",22,16,630,33,25,C.mint,true)
+    text(page,"Personal drones  /  Samples  /  Return to your enabled features between rounds",23,56,820,23,12,C.muted)
+    local sw=make("TextButton",{Name="EventAutoToggle",Text="",Position=UDim2.fromOffset(804,22),Size=UDim2.fromOffset(64,36),BackgroundColor3=Color3.fromRGB(67,76,91),BorderSizePixel=0,AutoButtonColor=false},page)
     round(sw,18)
-    local dot=make("Frame",{Name="Knob",Position=UDim2.fromOffset(3,3),Size=UDim2.fromOffset(30,30),BackgroundColor3=Color3.fromRGB(250,252,255),BorderSizePixel=0},sw);round(dot,15)
-    local activity=section(page,"BossActivity",24,96,844,148,"CURRENT ACTIVITY")
-    local encounter=section(page,"BossEncounter",24,258,844,80,"LIVE ENCOUNTER")
-    local flow=section(page,"BossFlow",24,352,844,142,"ENCOUNTER FLOW")
-    local serverSearch=section(page,"BossServerSearch",24,508,844,74,"SERVER SEARCH AFTER DEFEAT")
-    local stateText=text(activity,"OFF",16,39,812,32,22,purple,true)
-    local detail=text(activity,"Enable to wait for the next entrance portal.",16,82,812,50,13,C.text)
+    local dot=make("Frame",{Name="Knob",Position=UDim2.fromOffset(3,3),Size=UDim2.fromOffset(30,30),BackgroundColor3=C.text,BorderSizePixel=0},sw);round(dot,15)
+    local activity=section(page,"EventActivity",24,96,844,156,"CURRENT ACTIVITY")
+    local stateText=text(activity,"OFF",16,39,812,32,22,C.mint,true)
+    local detail=text(activity,"Enable to wait for the next drone outbreak.",16,82,812,60,13,C.text)
     detail.TextWrapped=true;detail.TextTruncate=Enum.TextTruncate.None;detail.TextYAlignment=Enum.TextYAlignment.Top
-    local hpText=text(encounter,"BOSS HP  /  --",16,37,240,28,16,C.text,true)
-    local timeText=text(encounter,"Waiting for event state...",270,38,264,23,11,C.muted)
-    local countText=text(encounter,"0 boss defeats observed this session",548,38,280,23,11,C.muted)
-    local explanation=text(flow,"Wait for the portal while other features continue.\nBreak the crystals, attack the exposed hand, and leave through the exit.\nA held egg is delivered before entry. Enabled features resume after the return.",16,42,812,84,12,C.text)
+    local progress=section(page,"EventProgress",24,268,844,108,"YOUR EVENT PROGRESS")
+    local samples=text(progress,"-- SAMPLES",16,36,280,28,20,C.mint,true)
+    local parts=text(progress,"-- / 5 parts",324,40,200,24,14,C.text,true)
+    local targets=text(progress,"-- personal drones",568,40,256,24,13,C.text)
+    local timeText=text(progress,"Reading the server schedule...",16,76,800,18,11,C.muted)
+    local flow=section(page,"EventFlow",24,392,844,184,"HOW IT WORKS")
+    local explanation=text(flow,"Wait for the server's event window while other features continue.\nDeliver a held egg first, then follow your own drones. The game handles bat attacks.\nCollect dropped rewards and return safely when the round ends.\nSamples stay in your wallet; spending and the Vault quest remain manual.",16,40,812,124,13,C.text)
     explanation.TextWrapped=true;explanation.TextTruncate=Enum.TextTruncate.None;explanation.TextYAlignment=Enum.TextYAlignment.Top
-    text(page,"WASD / Esc: release control. LEFT ALT: hide / show UI.",24,596,844,18,10,C.muted)
-    local hopSwitch=make("TextButton",{Name="BossHopToggle",Text="",Position=UDim2.fromOffset(760,19),Size=UDim2.fromOffset(64,36),BackgroundColor3=Color3.fromRGB(67,76,91),BorderSizePixel=0,AutoButtonColor=false},serverSearch)
-    round(hopSwitch,18)
-    local hopDot=make("Frame",{Position=UDim2.fromOffset(3,3),Size=UDim2.fromOffset(30,30),BackgroundColor3=C.text,BorderSizePixel=0},hopSwitch);round(hopDot,15)
-    local hopInfo=text(serverSearch,"Hop waits for a confirmed defeat. Search limit: 3 servers.",16,41,718,18,10,C.muted)
-
-    return {sw=sw,dot=dot,stateText=stateText,detail=detail,hpText=hpText,timeText=timeText,countText=countText,hopSwitch=hopSwitch,hopDot=hopDot,hopInfo=hopInfo}
+    text(page,"Priority can be changed in Overview. WASD / Esc releases control. LEFT ALT hides the UI.",24,594,844,20,10,C.muted)
+    return {sw=sw,dot=dot,stateText=stateText,detail=detail,samples=samples,parts=parts,targets=targets,timeText=timeText}
 end
 
-function UI.CreateRiftWidgets(page)
+function UI.CreateRiftWidgets(page,banners)
     local purple=Color3.fromRGB(185,151,255)
     text(page,"THE RIFT",22,16,570,33,25,purple,true)
     text(page,"One egg per trip  >  Train while eggs spawn / grow  >  Hatch  >  Trade 3 pets",23,54,790,22,12,C.muted)
-    local recipeSection=section(page,"RiftRecipe",22,90,848,72,"CURRENT RECIPE")
-    local activitySection=section(page,"RiftActivity",22,449,848,115,"CURRENT ACTIVITY")
-    local banner=text(recipeSection,"Reading current recipe...",16,34,558,26,20,C.text,true)
-    local timer=text(recipeSection,"--",590,35,242,25,12,purple,true)
-    local odds=text(page,"",23,166,844,18,10,C.muted)
+    local bannerButtons={}
+    local options={{Id="Any",DisplayName="Any active banner"}}
+    for _,entry in ipairs(banners) do table.insert(options,entry) end
+    for i,entry in ipairs(options) do
+        local choice=button(page,entry.DisplayName,22+(i-1)*213,84,207,30)
+        choice.Name="RiftBanner_"..entry.Id;bannerButtons[entry.Id]=choice
+    end
+    text(page,"Only trade the chosen banner when its server rotation is active.",24,118,844,16,10,C.muted)
+    local recipeSection=section(page,"RiftRecipe",22,141,848,60,"ACTIVE SERVER RECIPE")
+    local activitySection=section(page,"RiftActivity",22,466,848,98,"CURRENT ACTIVITY")
+    local banner=text(recipeSection,"Reading current recipe...",16,30,558,24,18,C.text,true)
+    local timer=text(recipeSection,"--",590,30,242,24,12,purple,true)
+    local odds=text(page,"",23,207,844,18,10,C.muted)
     local rows: {{card: Frame,icon: ImageLabel,name: TextLabel,rarity: TextLabel,detail: TextLabel,status: TextLabel}}={}
     for i=1,3 do
-        local card=make("Frame",{Name="Requirement"..i,Position=UDim2.fromOffset(22,190+(i-1)*84),Size=UDim2.fromOffset(848,77),BackgroundColor3=C.card,BorderSizePixel=0},page)
+        local card=make("Frame",{Name="Requirement"..i,Position=UDim2.fromOffset(22,231+(i-1)*77),Size=UDim2.fromOffset(848,71),BackgroundColor3=C.card,BorderSizePixel=0},page)
         round(card,10)
         local icon=make("ImageLabel",{Position=UDim2.fromOffset(12,11),Size=UDim2.fromOffset(55,55),BackgroundTransparency=1,ScaleType=Enum.ScaleType.Fit},card)
         local rarityLabel=text(card,"Rarity: --",80,34,430,16,10,C.muted,true)
         rarityLabel.Name="PetRarity"
         rows[i]={card=card,icon=icon,name=text(card,"--",80,7,430,25,16,C.text,true),rarity=rarityLabel,detail=text(card,"",80,53,750,18,11,C.muted),status=text(card,"--",595,14,237,26,14,purple,true)}
     end
-    local status=text(activitySection,"READY",16,35,816,27,17,purple,true)
-    local detail=text(activitySection,"Enable to keep collecting, hatching and trading each new recipe.",16,72,816,34,12,C.text)
+    local status=text(activitySection,"READY",16,30,816,25,16,purple,true)
+    local detail=text(activitySection,"Enable to keep collecting, hatching and trading each new recipe.",16,58,816,34,12,C.text)
     detail.TextWrapped=true;detail.TextTruncate=Enum.TextTruncate.None;detail.TextYAlignment=Enum.TextYAlignment.Top
     local sw=make("TextButton",{Name="RiftAutoToggle",Text="",Position=UDim2.fromOffset(804,22),Size=UDim2.fromOffset(64,36),BackgroundColor3=Color3.fromRGB(67,76,91),BorderSizePixel=0,AutoButtonColor=false},page)
     round(sw,18)
@@ -556,7 +559,7 @@ function UI.CreateRiftWidgets(page)
     local cycleLabel=text(page,"CONTINUOUS  /  0 event eggs confirmed  /  Lowest-income eligible pets first",24,574,844,18,10,C.muted)
     text(page,"WASD / Esc stops this run. Toggle choices are saved. Accepted trades finish claiming.",24,597,844,18,10,C.muted)
 
-    return {banner=banner,timer=timer,odds=odds,rows=rows,status=status,detail=detail,sw=sw,dot=dot,cycleLabel=cycleLabel}
+    return {bannerButtons=bannerButtons,banner=banner,timer=timer,odds=odds,rows=rows,status=status,detail=detail,sw=sw,dot=dot,cycleLabel=cycleLabel}
 end
 
 function UI.CreateStatsWidgets(ctx,page)
@@ -669,7 +672,7 @@ function UI.RenderStats(ctx,rows)
 end
 
 function UI.CreatePriorityControls(ctx,section)
-    local names={Boss="BOSS",Area="AUTO AREA",Index="AUTO INDEX",Rift="THE RIFT"}
+    local names={Event="DR SCRAMBLE",Area="AUTO AREA",Index="AUTO INDEX",Rift="THE RIFT"}
     local labels={}
     local function paint()
         for i,label in ipairs(labels)do label.Text=i.."  "..names[ctx.order[i]]end
@@ -950,7 +953,7 @@ function UI.CreateOverviewPage(ctx: OverviewViewContext,page: Frame): OverviewAP
     function api.record(kind: string,message: string): ()
         if not ctx.isAlive() then return end
         ledger.record(kind,message);dirty=true
-        if not notifications or (kind~="boss" and kind~="collection" and kind~="error") then return end
+        if not notifications or (kind~="event" and kind~="collection" and kind~="error") then return end
         local key=kind..":"..message
         if key==lastNotification and os.clock()-lastNotificationAt<20 then return end
         lastNotification=key;lastNotificationAt=os.clock()
@@ -964,20 +967,20 @@ function UI.CreateOverviewPage(ctx: OverviewViewContext,page: Frame): OverviewAP
     end
     local function syncStatus(): ()
         local owner=attribute("AutomationOwner")
-        local anyEnabled=gui:GetAttribute("AreaWatchEnabled") or gui:GetAttribute("RiftActive") or gui:GetAttribute("IndexEnabled") or gui:GetAttribute("BossEnabled")
-        local bossBusy=gui:GetAttribute("BossBusy")==true
+        local anyEnabled=gui:GetAttribute("AreaWatchEnabled") or gui:GetAttribute("RiftActive") or gui:GetAttribute("IndexEnabled") or gui:GetAttribute("EventEnabled")
+        local eventBusy=gui:GetAttribute("EventBusy")==true
         local runnerBusy=gui:GetAttribute("RunnerActive")==true
-        local anyBusy=bossBusy or runnerBusy or gui:GetAttribute("AreaWatchBusy")==true or gui:GetAttribute("IndexBusy")==true or gui:GetAttribute("RiftCommitting")==true
+        local anyBusy=eventBusy or runnerBusy or gui:GetAttribute("AreaWatchBusy")==true or gui:GetAttribute("IndexBusy")==true or gui:GetAttribute("RiftCommitting")==true
         local running=anyEnabled or anyBusy
         local function messagePhase(message: string,fallback: string): string
             local prefix=string.upper(message:match("^%s*([%a]+)") or "")
             local phases={CHECKING="Checking",COLLECTING="Collecting",COLLECTED="Complete",PLACING="Planting",HATCHING="Hatching",TRAINING="Training",WAITING="Waiting",LOADING="Loading",RETRYING="Retrying",COMPLETE="Complete",FINISHING="Finishing",OFF="Off",SELECT="Waiting"}
             return phases[prefix] or fallback
         end
-        if bossBusy then owner="Boss" end
+        if eventBusy then owner="Event" end
         local phase,message="",""
         if not running then owner=""
-        elseif owner=="Boss" then phase=attribute("BossPhase");message=attribute("BossMessage")
+        elseif owner=="Event" then phase=attribute("EventPhase");message=attribute("EventMessage")
         elseif runnerBusy then
             phase=attribute("RunnerPhase");message=attribute("RunnerMessage")
             if owner=="" then owner="Collection" end
@@ -986,22 +989,22 @@ function UI.CreateOverviewPage(ctx: OverviewViewContext,page: Frame): OverviewAP
         elseif owner=="Rift" or gui:GetAttribute("RiftActive") then owner="Rift";phase=attribute("RiftPhase");message=attribute("RiftMessage")
         elseif gui:GetAttribute("IndexEnabled") then owner="Index";message=attribute("IndexMessage");phase=messagePhase(message,"Waiting")
         elseif gui:GetAttribute("AreaWatchEnabled") then owner="Area";message=attribute("AreaWatchMessage");phase=messagePhase(message,"Waiting")
-        elseif gui:GetAttribute("BossEnabled") then owner="Boss";phase="Waiting";message="Waiting for an available boss portal." end
-        if running and gui:GetAttribute("RiftTraining")==true and not bossBusy and not runnerBusy then phase="Training" end
+        elseif gui:GetAttribute("EventEnabled") then owner="Event";phase="Waiting";message="Waiting for personal drones or the next event round." end
+        if running and gui:GetAttribute("RiftTraining")==true and not eventBusy and not runnerBusy then phase="Training" end
         if running and gui:GetAttribute("AutomationWaitingForLoad")==true and not anyBusy then
             phase="Loading";message="Waiting for your character, inventory and plot."
         end
-        local names={Area="Auto Area",Index="Auto Index",Boss="Auto Boss",Rift="The Rift",Collection="Collection"}
+        local names={Area="Auto Area",Index="Auto Index",Event="DR Scramble",Rift="The Rift",Collection="Collection"}
         currentText=owner~="" and ((names[owner] or owner)..(phase~="" and "  /  "..phase or "")) or "Ready"
         local waitReason=running and attribute("WaitReason") or ""
         nextText=running and attribute("NextAction") or ""
-        if bossBusy then
+        if eventBusy then
             nextText=(phase=="Leaving" or phase=="Returning safely" or phase=="Exit blocked")
                 and "Return to the safe zone, then resume your enabled features."
                 or "Finish this encounter, leave the arena, then resume your enabled features."
         elseif not anyEnabled and anyBusy then nextText="Finish the current task safely, then stop."
         elseif phase=="Training" and not anyBusy then nextText="Resume the first available task in your priority order."
-        elseif owner=="Boss" and phase=="Waiting" then nextText="Enter the boss portal when an encounter becomes available."
+        elseif owner=="Event" and phase=="Waiting" then nextText="Collect Samples when the next drone round opens."
         elseif phase=="Loading" and not anyBusy then nextText="Resume saved features when your character and plot are ready."
         elseif nextText=="" then nextText=anyEnabled and "Check the next available task in your priority order." or "Enable a feature to begin." end
         detailText=waitReason~="" and waitReason or message
@@ -1011,7 +1014,7 @@ function UI.CreateOverviewPage(ctx: OverviewViewContext,page: Frame): OverviewAP
         nowTitle.Text=waiting and "WAITING" or "NOW"
         dirty=true
     end
-    for _,name in ipairs({"AutomationOwner","RunnerActive","RunnerPhase","RunnerMessage","RiftPhase","RiftMessage","IndexMessage","AreaWatchMessage","BossPhase","BossMessage","BossBusy","AreaWatchBusy","IndexBusy","RiftCommitting","RiftTraining","AutomationWaitingForLoad","AreaWatchEnabled","RiftActive","IndexEnabled","BossEnabled","NextAction","WaitReason"}) do
+    for _,name in ipairs({"AutomationOwner","RunnerActive","RunnerPhase","RunnerMessage","RiftPhase","RiftMessage","IndexMessage","AreaWatchMessage","EventPhase","EventMessage","EventBusy","AreaWatchBusy","IndexBusy","RiftCommitting","RiftTraining","AutomationWaitingForLoad","AreaWatchEnabled","RiftActive","IndexEnabled","EventEnabled","NextAction","WaitReason"}) do
         connect(gui:GetAttributeChangedSignal(name),syncStatus)
     end
     local function duration(seconds: number): string
@@ -1175,9 +1178,9 @@ function UI.CreatePages(ctx: any)
     local areaTab=featureTab("AreasTab","AREAS","One-click collection",116)
     local autoTab=featureTab("AutoAreaTab","AUTO AREA","Area and rarity filters",178)
     local riftTab=featureTab("RiftTab","THE RIFT","Collect, hatch, combine",328)
-    local bossPage=make("Frame",{Name="BossPage",Position=UDim2.fromOffset(210,80),Size=UDim2.fromOffset(892,624),BackgroundColor3=C.side,BorderSizePixel=0,Visible=false},panel)
-    round(bossPage,12)
-    local bossTab=featureTab("BossTab","AUTO BOSS","Crystals, boss, return",390)
+    local eventPage=make("Frame",{Name="EventPage",Position=UDim2.fromOffset(210,80),Size=UDim2.fromOffset(892,624),BackgroundColor3=C.side,BorderSizePixel=0,Visible=false},panel)
+    round(eventPage,12)
+    local eventTab=featureTab("EventTab","DR SCRAMBLE","Drones and Samples",390)
     local statsPage=make("Frame",{Name="StatsEggsPage",Position=UDim2.fromOffset(210,80),Size=UDim2.fromOffset(892,624),BackgroundColor3=C.side,BorderSizePixel=0,Visible=false},panel) :: Frame
     round(statsPage,12)
     local statsTab=featureTab("StatsEggsTab","STATS EGGS","Hatching and income",478)
@@ -1186,8 +1189,8 @@ function UI.CreatePages(ctx: any)
     local indexTab=featureTab("IndexTab","AUTO INDEX","Complete collections",240)
     local function showEnabledTabs()
         indexTab.Title.TextColor3=gui:GetAttribute("IndexEnabled") and C.mint or C.text
-        bossTab.Title.Text=gui:GetAttribute("BossEnabled") and "AUTO BOSS  •" or "AUTO BOSS"
-        bossTab.Title.TextColor3=gui:GetAttribute("BossEnabled") and purple or C.text
+        eventTab.Title.Text=gui:GetAttribute("EventEnabled") and "DR SCRAMBLE  •" or "DR SCRAMBLE"
+        eventTab.Title.TextColor3=gui:GetAttribute("EventEnabled") and purple or C.text
         autoTab.Title.Text=gui:GetAttribute("AreaWatchEnabled") and "AUTO AREA  •" or "AUTO AREA"
         riftTab.Title.Text=gui:GetAttribute("RiftActive") and "THE RIFT  •" or "THE RIFT"
         autoTab.Title.TextColor3=gui:GetAttribute("AreaWatchEnabled") and C.mint or C.text
@@ -1195,12 +1198,12 @@ function UI.CreatePages(ctx: any)
     end
     connect(gui:GetAttributeChangedSignal("AreaWatchEnabled"),showEnabledTabs)
     connect(gui:GetAttributeChangedSignal("RiftActive"),showEnabledTabs)
-    connect(gui:GetAttributeChangedSignal("BossEnabled"),showEnabledTabs)
+    connect(gui:GetAttributeChangedSignal("EventEnabled"),showEnabledTabs)
     connect(gui:GetAttributeChangedSignal("IndexEnabled"),showEnabledTabs)
     showEnabledTabs()
     local function tab(name)
         areaPage.Visible=name=="Areas";watchPanel.Visible=name=="AutoArea";page.Visible=name=="Rift"
-        bossPage.Visible=name=="Boss"
+        eventPage.Visible=name=="Event"
         statsPage.Visible=name=="StatsEggs"
         indexPage.Visible=name=="Index"
         overviewPage.Visible=name=="Overview"
@@ -1210,8 +1213,8 @@ function UI.CreatePages(ctx: any)
         indexTab.SelectionMarker.Visible=name=="Index"
         statsTab.BackgroundColor3=name=="StatsEggs" and C.selected or C.card
         statsTab.SelectionMarker.Visible=name=="StatsEggs"
-        bossTab.BackgroundColor3=name=="Boss" and C.selected or C.card
-        bossTab.SelectionMarker.Visible=name=="Boss"
+        eventTab.BackgroundColor3=name=="Event" and C.selected or C.card
+        eventTab.SelectionMarker.Visible=name=="Event"
         areaTab.BackgroundColor3=name=="Areas" and C.selected or C.card
         autoTab.BackgroundColor3=name=="AutoArea" and C.selected or C.card
         riftTab.BackgroundColor3=name=="Rift" and C.selected or C.card
@@ -1224,16 +1227,17 @@ function UI.CreatePages(ctx: any)
     connect(areaTab.Activated,function()tab("Areas")end)
     connect(autoTab.Activated,function()tab("AutoArea")end)
     connect(riftTab.Activated,function()tab("Rift")end)
-    connect(bossTab.Activated,function()tab("Boss")end)
+    connect(eventTab.Activated,function()tab("Event")end)
     connect(statsTab.Activated,function()tab("StatsEggs")end)
     connect(indexTab.Activated,function()tab("Index")end)
     local savedTab=ctx.savedTab
-    local validTabs={Overview=true,Areas=true,AutoArea=true,Rift=true,Boss=true,StatsEggs=true,Index=true}
+    if ctx.savedTab=="Boss" then ctx.savedTab="Event" end
+    local validTabs={Overview=true,Areas=true,AutoArea=true,Rift=true,Event=true,StatsEggs=true,Index=true}
     tab(validTabs[savedTab] and savedTab or "Overview")
     return {
-        areaPage=areaPage,page=page,overviewPage=overviewPage,bossPage=bossPage,
+        areaPage=areaPage,page=page,overviewPage=overviewPage,eventPage=eventPage,
         statsPage=statsPage,indexPage=indexPage,select=tab,
-        tabs={Overview=overviewTab,Areas=areaTab,AutoArea=autoTab,Rift=riftTab,Boss=bossTab,StatsEggs=statsTab,Index=indexTab},
+        tabs={Overview=overviewTab,Areas=areaTab,AutoArea=autoTab,Rift=riftTab,Event=eventTab,StatsEggs=statsTab,Index=indexTab},
     }
 end
 

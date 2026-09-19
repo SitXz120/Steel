@@ -5,7 +5,7 @@ if not game:IsLoaded() then
 end
 
 -- EGG ATLAS | Steal An Egg | 2026-09-14
-local SCRIPT_VERSION="11.30.1"
+local SCRIPT_VERSION="11.31.0"
 local UI=...
 assert(type(UI)=="table" and UI.ApiVersion==1 and UI.Version==SCRIPT_VERSION,
     "UI module missing or incompatible. Run Loader.luau or the standalone EggAtlas.luau.")
@@ -80,12 +80,13 @@ for _, child in ipairs(parent:GetChildren()) do
             if indexOK and type(indexAreas)=="table" then previousConfig.indexAreas=indexAreas end
             local targetsOK,indexTargets=pcall(function()return game:GetService("HttpService"):JSONDecode(child:GetAttribute("IndexTargets") or "")end)
             if targetsOK and type(indexTargets)=="table" then previousConfig.indexTargets=indexTargets end
+            previousConfig.riftBanner=child:GetAttribute("RiftWantedBanner")
             previousConfig.indexStrategy=child:GetAttribute("IndexStrategy")
             previousConfig.indexCompletion=child:GetAttribute("IndexCompletion")
             local priorityOK,priorityOrder=pcall(function()return game:GetService("HttpService"):JSONDecode(child:GetAttribute("PriorityOrder") or "")end)
             if priorityOK and type(priorityOrder)=="table" then previousConfig.priorityOrder=priorityOrder end
             previousConfig.notifications=child:GetAttribute("NotificationsEnabled")
-            for key,attribute in pairs({autoArea="AutoAreaWanted",rift="RiftWanted",autoBoss="BossWanted",bossHop="BossHopWanted",autoIndex="IndexWanted"}) do
+            for key,attribute in pairs({autoArea="AutoAreaWanted",rift="RiftWanted",autoEvent="EventWanted",autoIndex="IndexWanted"}) do
                 local wanted=child:GetAttribute(attribute)
                 if type(wanted)=="boolean" then previousConfig[key]=wanted end
             end
@@ -119,6 +120,17 @@ local function isCollectible(r)
     return type(r) == "table" and (r.State == "Slot" or r.State == "Dropped")
         and type(r.AreaId) == "string" and type(r.NestId) == "string"
         and r.CarrierUserId == nil and r.OwnerUserId == nil and r.Placement == nil
+end
+local function isContestable(egg)
+    if type(egg)~="table" or egg.State~="Carried" or type(egg.CarrierUserId)~="number"
+        or egg.CarrierUserId==player.UserId or egg.OwnerUserId~=nil or egg.Placement~=nil
+        or type(egg.AreaId)~="string" or type(egg.NestId)~="string" then return false end
+    local other=Players:GetPlayerByUserId(egg.CarrierUserId)
+    local ch=other and other.Character
+    local hum=ch and ch:FindFirstChildOfClass("Humanoid")
+    if not other or not ch or not hum or hum.Health<=0 or other:GetAttribute("InBossArena") then return false end
+    local Guard=require(RS.Client.ToolGameplayGuard)
+    return Guard.IsInsideArena(other) and not Guard.IsInsideSafeZone(other)
 end
 local function fieldEggIncome(egg)
     local ok,rate=pcall(Earnings.MutationOnlyRatePerSecond,{
@@ -174,7 +186,7 @@ local gui,panel=window.gui,window.panel
 gui:SetAttribute("AreaIconMode","Pet")
 gui:SetAttribute("PortalAvoidance",true)
 local connections, alive = {}, true
-local runner, selectedTarget, riftController, bossController
+local runner, selectedTarget, riftController, eventController
 local sessionOverview
 local function recordEvent(kind: string,message: string)
     if sessionOverview then sessionOverview.record(kind,(message:gsub("^.-:%d+: ",""))) end
@@ -289,7 +301,7 @@ local configStore=createConfigStore({
     end,
 })
 if configStore.status=="CONFIG NEW" and previousConfig then configStore.data=previousConfig end
-local togglePreference={autoArea=configStore.data.autoArea==true,rift=configStore.data.rift==true,autoBoss=configStore.data.autoBoss==true,bossHop=configStore.data.bossHop==true}
+local togglePreference={autoArea=configStore.data.autoArea==true,rift=configStore.data.rift==true,autoEvent=configStore.data.autoEvent==true,}
 for _,area in ipairs(areaList)do
     local saved=configStore.data.indexAreas
     indexWatch.areas[area.id]=type(saved)~="table" or saved[area.id]==true
@@ -305,20 +317,20 @@ gui:SetAttribute("IndexEnabled",false)
 local restoringConfig=true
 gui:SetAttribute("AutoAreaWanted",togglePreference.autoArea)
 gui:SetAttribute("RiftWanted",togglePreference.rift)
-gui:SetAttribute("BossWanted",togglePreference.autoBoss)
-gui:SetAttribute("BossHopWanted",togglePreference.bossHop)
+gui:SetAttribute("EventWanted",togglePreference.autoEvent)
 local function rememberToggle(key,on)
     togglePreference[key]=on==true
-    gui:SetAttribute(key=="autoIndex" and "IndexWanted" or key=="autoArea" and "AutoAreaWanted" or (key=="autoBoss" and "BossWanted" or (key=="bossHop" and "BossHopWanted" or "RiftWanted")),on==true)
+    gui:SetAttribute(key=="autoIndex" and "IndexWanted" or key=="autoArea" and "AutoAreaWanted" or (key=="autoEvent" and "EventWanted" or "RiftWanted"),on==true)
     -- Explicit toggle choices must survive an immediate rejoin, without the UI debounce.
     configStore.request()
     configStore.flush()
 end
 local function createPriorityPolicy(saved)
-    local defaults={"Boss","Area","Index","Rift"}
+    local defaults={"Event","Area","Index","Rift"}
     local order,seen={},{}
     if type(saved)=="table" then
-        for _,name in ipairs(saved)do
+        for _,savedName in ipairs(saved)do
+            local name=savedName=="Boss" and "Event" or savedName
             if table.find(defaults,name) and not seen[name] then seen[name]=true;table.insert(order,name)end
         end
     end
@@ -373,7 +385,7 @@ local mountedWindow=UI.MountWindow({
     configStore.destroy()
     alive = false
     areaWatch.enabled=false;indexWatch.enabled=false
-    if bossController then bossController.destroy() end
+    if eventController then eventController.destroy() end
     if riftController then riftController.stop("Closed","UI closed") end
     if runner then runner.destroy() end
     for _, c in ipairs(connections) do c:Disconnect() end
@@ -736,7 +748,7 @@ local function createRunner(onStatus)
     end
     local function valid(r)
         if disposed or current~=r or not api.active or r.token~=serial then error("CANCELLED",0) end
-        if player:GetAttribute("InBossArena") and not r.bossEntry then error("Entered the boss arena. Auto movement stopped.",0) end
+        if player:GetAttribute("InBossArena") then error("Entered the boss arena. Auto movement stopped.",0) end
         if player.Character~=r.character or not r.root.Parent or r.hum.Health<=0 then error("Character changed or died",0) end
         if os.clock()>r.expires then error("Run exceeded 5 minutes. Manual control restored.",0) end
         if r.uid and not r.ownedUid and resetInterruptsTrip(r,FieldCycle.read(),tracked(r),player.UserId) then error(RESET_INTERRUPTED,0) end
@@ -809,7 +821,7 @@ local function createRunner(onStatus)
     end
     -- Compute the complete route before pickup. No pathfinder waits while escaping.
     local function navigationZones(r)
-        local zones=r.bossEntry and {} or table.clone(portals.snapshot())
+        local zones=table.clone(portals.snapshot())
         if r.avoidZones then
             for _,zone in ipairs(r.avoidZones()) do table.insert(zones,zone) end
         end
@@ -1019,7 +1031,7 @@ local function createRunner(onStatus)
             signal=interrupt and interrupt()
             if signal then halt(r);return signal end
             if r.resetMotion then points=nil;continue end
-            local path={points=points,index=2,done=false,approach=approach,goal=destination,cautious=r.bossEntry,intent=0}
+            local path={points=points,index=2,done=false,approach=approach,goal=destination,intent=0}
             r.path=path
             points=nil
             local sampleAt,lastPos=os.clock(),r.root.Position
@@ -1079,7 +1091,6 @@ local function createRunner(onStatus)
         local r=current
         if not r or not api.active or r.released then return end
         if player.Character~=r.character or not r.root.Parent or r.hum.Health<=0 then return end
-        if r.bossEntry and player:GetAttribute("InBossArena") then halt(r);return end
         local now=os.clock()
         if r.motionAt then
             local dtMotion=now-r.motionAt
@@ -1106,16 +1117,6 @@ local function createRunner(onStatus)
             if remaining<brakingZone then
                 commandedSpeed=math.min(r.hum.WalkSpeed,math.max(6,remaining*2.2))
                 fraction=commandedSpeed/math.max(r.hum.WalkSpeed,0.001)
-            end
-        end
-        if r.path.cautious then
-            local points,index=r.path.points,r.path.index
-            if points[index-1] and points[index] and points[index+1] then
-                local a,b=flat(points[index].Position-points[index-1].Position),flat(points[index+1].Position-points[index].Position)
-                if a.Magnitude>.1 and b.Magnitude>.1 and a.Unit:Dot(b.Unit)<.97 then
-                    commandedSpeed=math.min(commandedSpeed,math.max(10,flat(points[index].Position-r.root.Position).Magnitude/.18))
-                    fraction=commandedSpeed/math.max(r.hum.WalkSpeed,.001)
-                end
             end
         end
         local zones=navigationZones(r)
@@ -1196,7 +1197,7 @@ local function createRunner(onStatus)
             return true
         end
         local api={}
-        function api.step(goal,velocity,range)
+        function api.step(goal,velocity,range,stopDistance)
             filters()
             local from=r.root.Position
             local delta=flat(goal-from)
@@ -1214,7 +1215,7 @@ local function createRunner(onStatus)
                 -- Match motion along the interception direction. An incoming
                 -- carrier needs less closing speed, not their speed added to ours.
                 local following=direction.Magnitude>.01 and flat(velocity):Dot(direction.Unit) or 0
-                local standOff=math.clamp(range*.35,4,12)
+                local standOff=stopDistance or math.clamp(range*.35,4,12)
                 local speed=math.max(0,(distance-standOff)*8+following)
                 direct={points={{Position=from},{Position=step}},index=2,done=false,goal=step,
                     inputScale=math.clamp(speed/math.max(r.hum.WalkSpeed,1),0,1)}
@@ -1580,7 +1581,7 @@ local function createRunner(onStatus)
         end
         local ok,egg=pcall(findEgg,uid)
         if ok and not egg and uid==api.resumeTarget then egg=findEgg(api.resumeUid) end
-        if not ok or not egg or not (canPick(egg) or (egg.State=="Carried" and egg.CarrierUserId~=nil)) then say("Unavailable","This egg is no longer available.");return end
+        if not ok or not egg or not (canPick(egg) or isContestable(egg) or (egg.State=="Carried" and egg.CarrierUserId==player.UserId)) then say("Unavailable","This egg is no longer available.");return end
         local ch=player.Character
         local hum=ch and ch:FindFirstChildOfClass("Humanoid")
         local root=ch and ch:FindFirstChild("HumanoidRootPart")
@@ -1674,44 +1675,7 @@ local function createRunner(onStatus)
         end
         return nil
     end
-    local function portalEntryRoute(r,portal)
-        local params=RaycastParams.new()
-        params.FilterType=Enum.RaycastFilterType.Exclude
-        params.FilterDescendantsInstances={r.character,portal.Parent}
-        params.RespectCanCollide=true
-        local height=r.hum.HipHeight+r.root.Size.Y*.5
-        local function ground(point)
-            local hit=workspace:Raycast(point+Vector3.new(0,12,0),Vector3.new(0,-36,0),params)
-            if not hit or hit.Normal.Y<.65 then return nil end
-            return hit.Position+Vector3.new(0,height,0)
-        end
-        local options={}
-        for _,side in ipairs({-1,1}) do
-            local before=ground(portal.CFrame:PointToWorldSpace(Vector3.new(0,0,side*10)))
-            local after=ground(portal.CFrame:PointToWorldSpace(Vector3.new(0,0,-side*6)))
-            if before and after and math.abs(before.Y-after.Y)<4 then
-                local safe=true
-                for i=0,8 do if not ground(before:Lerp(after,i/8)) then safe=false;break end end
-                local delta=flat(after-before)
-                if safe and not workspace:Blockcast(CFrame.new(before),Vector3.new(3,4,3),delta,params) then
-                    table.insert(options,{before=before,after=after,distance=flat(before-r.root.Position).Magnitude})
-                end
-            end
-        end
-        table.sort(options,function(a,b)return a.distance<b.distance end)
-        local failure="Neither side of the boss portal has a supported, clear crossing"
-        for _,option in ipairs(options) do
-            local ok,points=pcall(plan,r,r.root.Position,option.before)
-            valid(r)
-            if ok then
-                table.insert(points,{Position=option.after,Action=Enum.PathWaypointAction.Walk})
-                return points,option.after
-            end
-            failure=tostring(points)
-        end
-        error("Boss entrance route unavailable: "..failure,0)
-    end
-    function api.travel(destination, label, interrupt, avoidZones,exitPoint,bossEntry)
+    function api.travel(destination, label, interrupt, avoidZones,exitPoint)
         assert(not disposed and not api.active,"Another trip is already active")
         local ch=player.Character
         local hum=ch and ch:FindFirstChildOfClass("Humanoid")
@@ -1729,7 +1693,6 @@ local function createRunner(onStatus)
             startedBlocked = FieldCycle.read().blocked,
             avoidZones = avoidZones,
             exitPoint = exitPoint,
-            bossEntry = bossEntry == true or typeof(bossEntry)=="Instance",
             requestSent = false,
         }
         current,api.active=r,true
@@ -1737,9 +1700,7 @@ local function createRunner(onStatus)
         local outcome
         local ok,err=pcall(function()
             controls:Disable();r.disabled=true
-            local prepared=nil
-            if typeof(bossEntry)=="Instance" then prepared,destination=portalEntryRoute(r,bossEntry) end
-            outcome=move(r,destination,interrupt,prepared,true)
+            outcome=move(r,destination,interrupt,nil,true)
         end)
         release(r)
         if current==r then
@@ -1749,6 +1710,32 @@ local function createRunner(onStatus)
         if not ok then error(err,0) end
         return outcome
     end
+    function api.follow(readTarget,label,avoidZones)
+        assert(not disposed and not api.active,"Another trip is already active")
+        local ch=player.Character
+        local hum=ch and ch:FindFirstChildOfClass("Humanoid")
+        local root=ch and ch:FindFirstChild("HumanoidRootPart")
+        assert(hum and root and hum.Health>0,"Character is not ready")
+        serial+=1
+        local r={token=serial,character=ch,hum=hum,root=root,phase="Travelling",expires=os.clock()+90,
+            resetEpoch=FieldCycle.read().epoch,requestSent=false,avoidZones=avoidZones}
+        current,api.active=r,true
+        say("Travelling",label)
+        local pursuit=createPursuit(r)
+        local ok,err=pcall(function()
+            controls:Disable();r.disabled=true
+            while true do
+                valid(r)
+                local point,velocity,range=readTarget()
+                if not point then break end
+                pursuit.step(point,velocity or Vector3.zero,range or 6,math.max(.5,range or 6))
+                Run.Heartbeat:Wait()
+            end
+        end)
+        pursuit.stop();release(r)
+        if current==r then current=nil;api.active=false;say(ok and "Arrived" or "Stopped",ok and "Target finished" or tostring(err)) end
+        if not ok then error(err,0) end
+    end
     function api.destroy()
         api.stop("Closed")
         disposed=true
@@ -1756,7 +1743,7 @@ local function createRunner(onStatus)
         for _,c in ipairs(connections) do c:Disconnect() end
     end
     table.insert(connections,player:GetAttributeChangedSignal("InBossArena"):Connect(function()
-        if player:GetAttribute("InBossArena") and not (bossController and bossController.busy) then
+        if player:GetAttribute("InBossArena") then
             api.stop("Entered the boss arena. Auto movement stopped.")
             if riftController then riftController.interruptForRecovery("Inside the boss arena") end
         end
@@ -1777,7 +1764,7 @@ end)
 gui:SetAttribute("RunnerActive",false)
 gui:SetAttribute("RunnerPhase","Idle")
 local function selectEgg(row)
-    if (bossController and bossController.busy) or runner.active or manualStarting then runDetail.Text="A trip is already in progress. Wait or use STOP TRIP.";return end
+    if (eventController and eventController.busy) or runner.active or manualStarting then runDetail.Text="A trip is already in progress. Wait or use STOP TRIP.";return end
     if areaWatch.enabled or indexWatch.enabled or (riftController and (riftController.active or riftController.committing)) then
         runDetail.Text="Pause Auto Area, Auto Index and The Rift before starting a manual collection.";return
     end
@@ -1785,12 +1772,12 @@ local function selectEgg(row)
     gui:SetAttribute("SelectedEggUid",row.uid)
     targetLabel.Text=row.pet.."  /  "..row.rarity.."  /  "..row.area.."  /  "..row.nest
     runStatus.Text="STARTING"
-    runDetail.Text="Starting your collection trip..."
+    runDetail.Text=row.carrierId and "Following the carrier until this egg drops; then returning safely." or "Starting your collection trip..."
     if riftController then riftController.collectOnce(row.uid) else runner.start(row.uid) end
     render(false)
 end
 connect(stopTrip.Activated,function()
-    if bossController and bossController.busy then runDetail.Text="Auto Boss owns this trip. Use its toggle to leave, or WASD for manual control.";return end
+    if eventController and eventController.busy then runDetail.Text="DR Scramble owns this trip. Use its toggle to leave, or WASD for manual control.";return end
     if areaWatch.enabled or indexWatch.enabled or (riftController and riftController.active) then
         runDetail.Text="This trip belongs to automation. Use its feature toggle or WASD to stop.";return
     end
@@ -1803,7 +1790,7 @@ local function readSnapshot()
     local field = State.ReadFieldEggs()
     assert(type(field) == "table" and type(field.Records) == "table", "Field records unavailable")
     for key, r in pairs(field.Records) do
-        if isCollectible(r) and groups[r.AreaId] then
+        if (isCollectible(r) or isContestable(r)) and groups[r.AreaId] then
             local config = Assets.Directory[r.AssetCategory]
             local mutations = r.Mutations or {}
             local weightOK, weight = pcall(Records.WeightKgForScale, r.AssetCategory, r.AssetScale)
@@ -1814,6 +1801,7 @@ local function readSnapshot()
             local mutation = #mutations > 0 and table.concat(mutations, ", ") or "Normal"
             table.insert(groups[r.AreaId], {
                 uid = tostring(r.Uid or key), pet = pet, mutation = mutation,
+                carrierId=r.CarrierUserId,carrierName=r.CarrierUserId and (Players:GetPlayerByUserId(r.CarrierUserId) and Players:GetPlayerByUserId(r.CarrierUserId).DisplayName or tostring(r.CarrierUserId)) or nil,
                 rarity = rarity, rarityColor = rarityColor,
                 nest = r.NestId, state = r.State, area = r.AreaId, weight = weightOK and weight or nil,
                 rate = rate, icon = type(icon) == "string" and icon or "",
@@ -1851,7 +1839,7 @@ local function snapshotKey(groups)
     for _,area in ipairs(areaList) do
         table.insert(parts,area.id..":"..tostring(area.requiredPower))
         for _,row in ipairs(groups[area.id] or {}) do
-            table.insert(parts,table.concat({row.uid,row.query,row.state,tostring(row.weight),tostring(row.rate),row.icon},"\31"))
+            table.insert(parts,table.concat({row.uid,row.query,row.state,tostring(row.carrierId),tostring(row.carrierName),tostring(row.weight),tostring(row.rate),row.icon},"\31"))
         end
     end
     return table.concat(parts,"\30")
@@ -1893,7 +1881,7 @@ local function eggChanged()
     if requestRiftRefresh then requestRiftRefresh() end
 end
 for _,signal in ipairs({State.FieldRefreshed,State.FieldShifted,State.FieldGone,
-    State.SnapshotRefreshed,State.ResetCountdown,State.ResetFade}) do
+    State.SnapshotRefreshed,State.CarryChanged,State.FieldClaimed,State.ResetCountdown,State.ResetFade}) do
     connect(signal,eggChanged)
 end
 refresh()
@@ -1906,1167 +1894,291 @@ task.spawn(function()
     end
 end)
 
--- Boss decisions use replicated phase/health, never a fixed number of hits.
-local function bossTarget(arena,position)
-    local boss=arena and arena:FindFirstChild("Boss")
-    if not boss or boss:GetAttribute("Spawning") then return nil,"Waiting for boss" end
-    if not boss:GetAttribute("PhaseTwoAt") then
-        local towers=arena:FindFirstChild("CrystalTowers")
-        local nearest,distance=nil,math.huge
-        if towers then for _,tower in ipairs(towers:GetChildren()) do
-            local hitbox=tower:FindFirstChild("Hitbox")
-            local health=hitbox and hitbox:GetAttribute("Health")
-            if hitbox and hitbox:IsA("BasePart") and type(health)=="number" and health>0 then
-                local d=(hitbox.Position-position).Magnitude
-                if d<distance then nearest,distance=hitbox,d end
-            end
-        end end
-        return nearest,nearest and "Crystals" or "Waiting for next phase"
+-- DR Scramble: replicated personal targets, normal movement and game-owned attacks.
+local function createScrambleModel(owner)
+    local api={snapshot=nil :: any,latestState=nil :: any,drones={},drops={},droneRevision=-1,stateRevision=-1,fullRevision=-1,ready=false,pending={}}
+    function api.applyDrones(packet)
+        if type(packet)~="table" or packet.OwnerUserId~=owner or type(packet.Revision)~="number" or packet.Revision<=api.droneRevision then return end
+        if not api.ready and not packet.Full then api.pending[packet.Revision]=packet;return end
+        api.ready=true;api.droneRevision=packet.Revision
+        if packet.Full then table.clear(api.drones) end
+        for _,id in ipairs(packet.Removed or {}) do api.drones[id]=nil end
+        for _,drone in ipairs(packet.Upserts or {}) do
+            if drone.OwnerUserId==owner and type(drone.Id)=="string" then api.drones[drone.Id]=drone end
+        end
+        local revisions={}
+        for revision in pairs(api.pending) do table.insert(revisions,revision) end
+        table.sort(revisions)
+        for _,revision in ipairs(revisions) do local queued=api.pending[revision];api.pending[revision]=nil;api.applyDrones(queued) end
     end
-    local arm=arena:FindFirstChild("SlamArmHitbox")
-    local hand=boss:FindFirstChild("UpperHand1.R",true)
-    local healthUI=hand and hand:FindFirstChild("Health")
-    if boss:GetAttribute("Attacking") and arm and arm:IsA("BasePart") and healthUI
-        and (not healthUI:IsA("BillboardGui") or healthUI.Enabled) then return arm,"Boss hand" end
-    return nil,"Waiting for hand"
-end
-
--- Predict moving danger volumes without modifying their parts or damage handlers.
--- The arena is an irregular mesh. Its bounding rectangle includes empty space.
-local function createBossNavigation()
-    local PF=game:GetService("PathfindingService")
-    local floor=nil
-    local cache={}
-    local cacheAt=0
-    local params=RaycastParams.new()
-    params.FilterType=Enum.RaycastFilterType.Include
-    params.RespectCanCollide=true
-    local blockers=RaycastParams.new()
-    blockers.FilterType=Enum.RaycastFilterType.Include
-    blockers.RespectCanCollide=true
-    local goal,route,index=nil,nil,2
-    local planning=false
-    local nextPlan=0
-    local revision=0
-    local direct=false
-    local nextDirect=0
-    local aliveNavigation=true
-    local function flat(v)return Vector3.new(v.X,0,v.Z)end
-    local function refresh()
-        local arena=workspace:FindFirstChild("BossArena")
-        local value=arena and arena:FindFirstChild("Floor")
-        if value~=floor or os.clock()-cacheAt>5 then
-            cache={};cacheAt=os.clock()
-            if value~=floor then route=nil;revision+=1 end
-            floor=value
-            -- The base mesh has seams covered by walkable Map cliff/platform
-            -- meshes. They are real support, unlike the empty arena corners.
-            local surfaces=floor and {floor} or {}
-            local map=arena and arena:FindFirstChild("Map")
-            if map then table.insert(surfaces,map) end
-            params.FilterDescendantsInstances=surfaces
-            blockers.FilterDescendantsInstances=arena and {arena} or {}
-        end
-        return floor
-    end
-    local function cell(x,z)
-        local key=x..":"..z
-        if cache[key]~=nil then return cache[key] end
-        local hit=workspace:Raycast(Vector3.new(x*4,floor.Position.Y+24,z*4),Vector3.new(0,-48,0),params)
-        local supported=hit~=nil and hit.Normal.Y>.65
-        cache[key]=supported
-        return supported
-    end
-    local function supported(p)
-        if not refresh() then return false end
-        local x,z=math.floor(p.X/4+.5),math.floor(p.Z/4+.5)
-        -- Check the footprint, not just a ray under the root's centre.
-        return cell(x,z) and cell(x-1,z) and cell(x+1,z) and cell(x,z-1) and cell(x,z+1)
-    end
-    local function segment(a,b,groundPoints)
-        if not refresh() then return false end
-        local n=math.max(1,math.ceil(flat(b-a).Magnitude/6))
-        for i=0,n do if not supported(a:Lerp(b,i/n)) then return false end end
-        local legs=math.max(1,math.ceil(flat(b-a).Magnitude/256))
-        for i=1,legs do
-            local start=a:Lerp(b,(i-1)/legs)
-            local finish=a:Lerp(b,i/legs)
-            local lift=groundPoints and 3.5 or 0
-            local castStart=Vector3.new(start.X,math.max(floor.Position.Y+3.5,start.Y+lift),start.Z)
-            local castEnd=Vector3.new(finish.X,math.max(floor.Position.Y+3.5,finish.Y+lift),finish.Z)
-            local delta=castEnd-castStart
-            if delta.Magnitude>.01 then
-                local hit=workspace:Blockcast(CFrame.new(castStart),Vector3.new(4,4,4),delta,blockers)
-                -- A walkable slope is ground, not a wall. The navmesh can route
-                -- over these cliff surfaces while a low box sweep touches them.
-                if hit and (not hit.Normal or hit.Normal.Y<.65) then return false end
-            end
-        end
-        return true
-    end
-    local function motionRisk(position,direction,speed,velocity)
-        if not refresh() then return 1000000000 end
-        local n=math.clamp(math.ceil((speed+velocity.Magnitude)*.55/6),6,60)
-        local risk=0
-        for i=1,n do
-            local t=.55*i/n
-            local p=position+direction*speed*t+(velocity-direction*speed)*(.08*(1-math.exp(-t/.08)))
-            if not supported(p) then risk+=1000000000/(t+.1) end
-        end
-        local delta=direction*speed*.55+(velocity-direction*speed)*(.08*(1-math.exp(-.55/.08)))
-        if delta.Magnitude>.01 then
-            local hit=workspace:Blockcast(CFrame.new(position.X,math.max(position.Y,floor.Position.Y+3.5),position.Z),Vector3.new(4,4,4),delta,blockers)
-            if hit and (not hit.Normal or hit.Normal.Y<.65) then risk+=1000000000 end
-        end
-        return risk
-    end
-    local function direction(root,hum,destination)
-        if not destination then goal=nil;route=nil;revision+=1;return Vector3.zero end
-        if not goal or flat(destination-goal).Magnitude>8 then
-            goal=destination;route=nil;revision+=1;nextDirect=0;nextPlan=0
-        end
-        local now=os.clock()
-        if now>=nextDirect then direct=segment(root.Position,destination);nextDirect=now+.15 end
-        local target=destination
-        if not direct then
-            if not route and not planning and now>=nextPlan then
-                planning=true;nextPlan=now+.8
-                local token=revision
-                local start,finish=root.Position,destination
-                task.spawn(function()
-                    local ok,points=pcall(function()
-                        local path=PF:CreatePath({AgentRadius=6,AgentHeight=5,AgentCanJump=false,WaypointSpacing=8})
-                        path:ComputeAsync(start,finish)
-                        if path.Status~=Enum.PathStatus.Success then return nil end
-                        local result=path:GetWaypoints()
-                        for i=2,#result do if not segment(result[i-1].Position,result[i].Position,true) then return nil end end
-                        if #result<2 or not segment(result[#result].Position,finish) then return nil end
-                        if flat(result[#result].Position-finish).Magnitude>.1 then
-                            table.insert(result,{Position=finish,Action=Enum.PathWaypointAction.Walk})
-                        end
-                        return result
-                    end)
-                    planning=false
-                    if aliveNavigation and token==revision and ok then route=points;index=2 end
-                end)
-            end
-            if not route then return Vector3.zero end
-            -- The final point must use arrival precision, not corner-skipping
-            -- distance: exit stages require 2-3 studs, so skipping it at 5 stalls.
-            while index<#route and flat(route[index].Position-root.Position).Magnitude<5 do index+=1 end
-            -- Look ahead only along a checked corridor. Eight-stud waypoints
-            -- must not each become a braking/stop destination at high speed.
-            local lookAhead=math.max(24,hum.WalkSpeed*.3)
-            for nextIndex=index+1,math.min(#route,index+10) do
-                local nextPoint=route[nextIndex].Position
-                if flat(nextPoint-root.Position).Magnitude>lookAhead then break end
-                if not segment(root.Position,nextPoint+Vector3.new(0,3.5,0)) then break end
-                index=nextIndex
-            end
-            target=route[index].Position
-            if index==#route and flat(target-root.Position).Magnitude<=1 then
-                if segment(root.Position,destination) then target=destination
-                else route=nil;nextPlan=0;return Vector3.zero end
-            end
-            if not segment(root.Position,target+Vector3.new(0,3.5,0)) then route=nil;return Vector3.zero end
-        else route=nil end
-        local delta=flat(target-root.Position)
-        if delta.Magnitude<=1 then return Vector3.zero end
-        -- Ease into a corner instead of skipping its waypoint at high speed.
-        local fraction=math.min(1,delta.Magnitude/math.max(5,hum.WalkSpeed*.12))
-        return delta.Unit*fraction
-    end
-    return {supported=supported,segment=segment,motionRisk=motionRisk,direction=direction,
-        reset=function()goal=nil;route=nil;index=2;revision+=1;nextDirect=0;nextPlan=0 end,
-        destroy=function()aliveNavigation=false;revision+=1;route=nil;cache={}end}
-end
-
-local function createBossEvasion(navigation)
-    -- Immutable prediction samples shared by every candidate in every frame.
-    local predictionTimes={.04,.09,.16,.25,.38,.55}
-    local predictionDrift={}
-    for i,t in ipairs(predictionTimes) do predictionDrift[i]=.08*(1-math.exp(-t/.08)) end
-    local boxAxes={"X","Z"}
-    local samples=setmetatable({},{__mode="k"})
-    local lastDirection=Vector3.zero
-    local nextJump=0
-    local function flat(v)return Vector3.new(v.X,0,v.Z)end
-    local function boxDistance(cf,size,position)
-        local p=cf:PointToObjectSpace(Vector3.new(position.X,cf.Y,position.Z))
-        return Vector2.new(math.max(0,math.abs(p.X)-size.X*.5),math.max(0,math.abs(p.Z)-size.Z*.5)).Magnitude
-    end
-    local function scan(root,speed,now)
-        local hazards={}
-        local arena=workspace:FindFirstChild("BossArena")
-        local center=arena and arena:FindFirstChild("BossSpawn")
-        local floor=arena and arena:FindFirstChild("Floor")
-        local boss=arena and arena:FindFirstChild("Boss")
-        local rings={}
-        local function include(part,kind)
-            if not part or not part:IsA("BasePart") then return end
-            local old=samples[part]
-            local velocity=Vector3.zero
-            if old then
-                local elapsed=now-old.time
-                velocity=old.velocity
-                if elapsed>=.04 then
-                    velocity=flat(part.Position-old.position)/elapsed
-                    if velocity.Magnitude>500 then velocity=Vector3.zero end
-                    samples[part]={time=now,position=part.Position,velocity=velocity}
-                end
-            else samples[part]={time=now,position=part.Position,velocity=velocity} end
-            local distance=boxDistance(part.CFrame,part.Size,root.Position)
-            if kind=="hole" then distance=flat(part.Position-root.Position).Magnitude end
-            if kind=="x" and floor then
-                local length=math.max(floor.Size.X,floor.Size.Z)
-                local futureSize=Vector3.new(part.Size.X,part.Size.Y,math.min(length,part.Size.Z+length*.55))
-                distance=math.min(distance,boxDistance(part.CFrame,futureSize,root.Position))
-            end
-            if distance>math.max(65,speed*.7+40) then return end
-            local hazard={kind=kind,part=part,cf=part.CFrame,size=part.Size,velocity=velocity}
-            if kind=="hole" then
-                local radius=part.Size.Y*.5
-                local mature=radius>=19.9 or (old and old.mature) or (boss and boss:GetAttribute("Attacking"))
-                samples[part].mature=mature
-                hazard.radius=radius
-                hazard.activateAfter=mature and 0 or math.max(0,(20-radius)/5)
-                hazard.radiusRate=boss and boss:GetAttribute("Attacking") and -20/3 or (mature and 0 or 5)
-            elseif kind=="x" and floor then
-                hazard.maxLength=math.max(floor.Size.X,floor.Size.Z)
-                hazard.growRemaining=math.max(0,1-part.Size.Z/hazard.maxLength)
-            end
-            table.insert(hazards,hazard)
-        end
-        include(workspace:FindFirstChild("BossBlackHole"),"hole")
-        local folder=workspace:FindFirstChild("BossHazards")
-        if folder then for _,part in ipairs(folder:GetChildren()) do
-            if part.Name=="XBar" then include(part,"x")
-            -- XIndicator is a harmless warning; only the live XBar can request a jump.
-            elseif part.Name=="RingSegment" and part:IsA("BasePart") and part.Transparency<.98 then
-                if center and center:IsA("BasePart") then
-                    -- The game tests a complete expanding circle, not the 32 visual boxes.
-                    local radius=flat(part.Position-center.Position).Magnitude
-                    local key=math.floor(radius/6+.5)
-                    if not rings[key] then
-                        rings[key]=true
-                        local distance=math.abs(flat(root.Position-center.Position).Magnitude-radius)
-                        if distance<speed*.7+45 then
-                            table.insert(hazards,{kind="annulus",cf=CFrame.new(center.Position.X,part.Position.Y,center.Position.Z),
-                                size=Vector3.zero,velocity=Vector3.zero,radius=radius,radialSpeed=part.Transparency>.21 and 0 or 40})
-                        end
-                    end
-                else include(part,"ring") end
-            end
-        end end
-        local hand=boss and boss:FindFirstChild("UpperHand1.R",true)
-        local health=hand and hand:FindFirstChild("Health")
-        if boss and boss:GetAttribute("Attacking") and not (health and (not health:IsA("BillboardGui") or health.Enabled)) then
-            include(arena:FindFirstChild("SlamArmHitbox"),"slam")
-        end
-        return hazards,floor
-    end
-    local function evaluate(position,direction,speed,hazards,floor,jumpVelocity,verticalVelocity,grounded,horizontalVelocity,predictionLimit: number?)
-        local risk=0
-        local previous={}
-        local previousY=position.Y
-        local previousTime=0
-        local extraTime=0
-        local extendedHoles={}
-        for i,h in ipairs(hazards) do
-            previous[i]=h.kind=="annulus" and (flat(position-h.cf.Position).Magnitude-h.radius)
-                or h.kind=="hole" and flat(position-h.cf.Position) or h.cf:PointToObjectSpace(position)
-            if h.kind=="hole" then
-                -- Slow characters need more than the normal 0.55 second horizon
-                -- to leave a hole before its four-second harmless windup ends.
-                local activateAfter=h.activateAfter or 0
-                local escapeSeconds=math.max(0,24-flat(position-h.cf.Position).Magnitude)/math.max(speed,1)+.12
-                if activateAfter>.55 and activateAfter<=math.min(4,escapeSeconds) then
-                    extraTime=math.max(extraTime,activateAfter)
-                    extendedHoles[i]=true
-                end
-            end
-        end
-        local times=predictionTimes
-        if extraTime>0 then times=table.clone(predictionTimes);table.insert(times,extraTime) end
-        local function segmentBox(a,b,size)
-            local lo,hi=0,1
-            for _,axis in ipairs(boxAxes) do
-                local start,delta=a[axis],b[axis]-a[axis]
-                local extent=size[axis]*.5+5
-                if math.abs(delta)<.0001 then
-                    if math.abs(start)>extent then return nil end
-                else
-                    local x,y=(-extent-start)/delta,(extent-start)/delta
-                    lo=math.max(lo,math.min(x,y));hi=math.min(hi,math.max(x,y))
-                    if lo>hi then return nil end
-                end
-            end
-            return lo,hi
-        end
-        local motion=direction*speed
-        local inertia=horizontalVelocity and horizontalVelocity-motion
-        for sampleIndex,t in ipairs(times) do
-            if predictionLimit and t>predictionLimit then break end
-            local extendedSample=sampleIndex>#predictionTimes
-            local p=position+motion*t
-            -- Account for the distance travelled while the humanoid turns/brakes.
-            if inertia then p+=inertia*(predictionDrift[sampleIndex] or .08*(1-math.exp(-t/.08))) end
-            local y=position.Y+(jumpVelocity or verticalVelocity)*t-workspace.Gravity*t*t*.5
-            if grounded~=false and not jumpVelocity and math.abs(verticalVelocity)<1 then y=math.max(position.Y,y) end
-            if not extendedSample and floor and floor:IsA("BasePart") then
-                local q=floor.CFrame:PointToObjectSpace(p)
-                local outside=Vector2.new(math.max(0,math.abs(q.X)-floor.Size.X*.5+8),math.max(0,math.abs(q.Z)-floor.Size.Z*.5+8)).Magnitude
-                -- Leaving the floor must never be cheaper than crossing a skill.
-                if outside>0 then risk+=1000000*(1+outside*outside) end
-            end
-            for index,h in ipairs(hazards) do
-                -- A windup extension belongs only to the hole needing extra
-                -- escape time, not an unrelated ring, slam or rotating cross.
-                if extendedSample and not extendedHoles[index] then continue end
-                local cf=h.cf+h.velocity*t
-                local size=h.size
-                if h.kind=="x" then
-                    cf=cf*CFrame.Angles(0,math.rad(20)*math.max(0,t-(h.growRemaining or 0)),0)
-                    if h.maxLength then size=Vector3.new(size.X,size.Y,math.min(h.maxLength,size.Z+h.maxLength*t)) end
-                end
-                local margin
-                if h.kind=="hole" then
-                    -- The windup is harmless; follow the real growth/retraction radius.
-                    local radius=math.clamp((h.radius or 20)+(h.radiusRate or 0)*t,0,20)
-                    local activateAfter=h.activateAfter or 0
-                    local relative=flat(p-cf.Position)
-                    margin=t<activateAfter and math.huge or relative.Magnitude-(radius+4)
-                    if t>=activateAfter then
-                        -- Sweep the whole interval: high game speeds can cross
-                        -- a complete hole between two prediction samples.
-                        local before=previous[index]
-                        if activateAfter>previousTime then
-                            before=before:Lerp(relative,(activateAfter-previousTime)/(t-previousTime))
-                        end
-                        local delta=relative-before
-                        local lengthSquared=delta:Dot(delta)
-                        local alpha=lengthSquared>.0001 and math.clamp(-before:Dot(delta)/lengthSquared,0,1) or 0
-                        local startRadius=math.clamp((h.radius or 20)+(h.radiusRate or 0)*math.max(previousTime,activateAfter),0,20)
-                        margin=math.min(margin,(before+delta*alpha).Magnitude-(math.max(radius,startRadius)+4))
-                    end
-                    previous[index]=relative
-                elseif h.kind=="annulus" then
-                    local offset=flat(p-cf.Position).Magnitude-(h.radius+h.radialSpeed*t)
-                    margin=math.abs(offset)-5
-                    local before=previous[index]
-                    local alpha=before*offset<=0 and math.abs(before)/math.max(.001,math.abs(before)+math.abs(offset)) or nil
-                    local crossingY=alpha and (previousY+(y-previousY)*alpha) or y
-                    if alpha and crossingY<=cf.Y+5 then margin=math.min(margin,-1) end
-                    if y>cf.Y+5 and (not alpha or crossingY>cf.Y+5) then margin=math.huge end
-                    previous[index]=offset
-                else
-                    margin=boxDistance(cf,size,p)-5
-                    local localPoint=cf:PointToObjectSpace(p)
-                    local enter,leave=segmentBox(previous[index],localPoint,size)
-                    local groundHazard=h.kind=="ring" or h.kind=="x"
-                    if groundHazard and y>cf.Y+5 then margin=math.huge end
-                    if enter then
-                        local entryY=previousY+(y-previousY)*enter
-                        local exitY=previousY+(y-previousY)*leave
-                        if not groundHazard or math.min(entryY,exitY)<=cf.Y+5 then margin=math.min(margin,-1) end
-                    end
-                    previous[index]=localPoint
-                end
-                if margin<0 then
-                    local weight=h.kind=="slam" and 300 or 180
-                    risk+=weight*(1+math.min(-margin,30)*.12)/(t+.1)
-                end
-            end
-            previousY=y;previousTime=t
-        end
-        return risk
-    end
-    local function steer(root: BasePart,hum: Humanoid,desired: Vector3,_dt: number)
-        local now=os.clock()
-        local hazards,floor=scan(root,hum.WalkSpeed,now)
-        local speed: number=hum.WalkSpeed
-        local position=root.Position
-        local vertical=root.AssemblyLinearVelocity.Y
-        local horizontal=flat(root.AssemblyLinearVelocity)
-        local grounded=hum.FloorMaterial~=Enum.Material.Air
-        local walking,jumping={},{}
-        for _,h in ipairs(hazards) do
-            if h.kind=="x" or h.kind=="annulus" or h.kind=="ring" then table.insert(jumping,h)
-            else table.insert(walking,h) end
-        end
-        -- A direction may appear in the trigger, fallback and candidate scoring.
-        -- Cache only within this frame: moving hazards are always rescanned next frame.
-        local riskCache,terrainCache={},{}
-        local function risk(direction)
-            local value=riskCache[direction]
-            if value==nil then
-                -- Holes and arm strikes still need a ground escape while cross/ring hazards request a jump.
-                value=evaluate(position,direction,speed,walking,floor,nil,0,true,horizontal)
-                riskCache[direction]=value
-            end
-            return value
-        end
-        local function terrain(direction)
-            local value=terrainCache[direction]
-            if value==nil then
-                value=navigation and navigation.motionRisk(position,direction,speed,horizontal) or 0
-                terrainCache[direction]=value
-            end
-            return value
-        end
-        local chosen=desired
-        local evading=false
-        if risk(desired)>0 or terrain(desired)>0 then
-            local candidates={{direction=Vector3.zero,distance=0}}
-            -- A full step can cross a hazard beyond our approach point. Keep
-            -- making safe progress instead of choosing only retreat or zero.
-            if desired.Magnitude>.01 then
-                for _,fraction in ipairs({.75,.5,.25,.1}) do
-                    table.insert(candidates,{direction=desired*fraction,distance=0})
-                end
-            end
-            local function target(point: Vector3,feedForward: number?)
-                local delta=flat(point-position)
-                if delta.Magnitude<.01 then return end
-                if navigation and navigation.supported and not navigation.supported(point) then return end
-                local input=math.clamp((delta.Magnitude*6+(feedForward or 0))/math.max(speed,1),0,1)
-                table.insert(candidates,{direction=delta.Unit*input,distance=delta.Magnitude})
-            end
-            for _,h in ipairs(walking) do
-                if h.kind=="hole" then
-                    local delta=flat(position-h.cf.Position)
-                    local away=delta.Magnitude>.01 and delta.Unit
-                        or (desired.Magnitude>.01 and desired.Unit or Vector3.xAxis)
-                    local closing=math.max(0,flat(h.velocity):Dot(away))
-                    -- Match a nearby pursuer instead of fleeing at a fixed fraction
-                    -- forever. The target is just outside its damage radius.
-                    local radius=math.clamp((h.radius or 20)+math.max(0,h.radiusRate or 0)*.2,0,20)
-                    local clearance=radius+6+closing*.12
-                    local point=h.cf.Position+away*clearance
-                    point=Vector3.new(point.X,position.Y,point.Z)
-                    local error=clearance-delta.Magnitude
-                    local input=math.clamp((closing+math.max(0,error)*6)/math.max(speed,1),0,1)
-                    table.insert(candidates,{direction=away*input,distance=math.max(0,error)})
-                    target(point,closing)
-                    -- Only short adjacent escapes if the radial exit is obstructed.
-                    if terrain(away*input)>0 then
-                        local side=Vector3.new(-away.Z,0,away.X)
-                        for _,sign in ipairs({-1,1}) do
-                            local heading=(away+side*.5*sign).Unit
-                            target(position+heading*math.max(6,error),closing)
-                        end
-                    end
-                elseif h.kind=="slam" then
-                    local localPoint=h.cf:PointToObjectSpace(position)
-                    local half=h.size*.5
-                    for _,sign in ipairs({-1,1}) do
-                        for _,p in ipairs({
-                            Vector3.new(sign*(half.X+6),localPoint.Y,math.clamp(localPoint.Z,-half.Z,half.Z)),
-                            Vector3.new(math.clamp(localPoint.X,-half.X,half.X),localPoint.Y,sign*(half.Z+6)),
-                        }) do target(h.cf:PointToWorldSpace(p)) end
-                    end
-                end
-            end
-            -- Terrain fallback only: these directions never evade a cross or expanding ring.
-            if terrain(desired)>0 or risk(Vector3.zero)>=1000000 then
-                for _,direction in ipairs({Vector3.xAxis,-Vector3.xAxis,Vector3.zAxis,-Vector3.zAxis}) do
-                    target(position+direction*8)
-                end
-            end
-            local bestScore=math.huge
-            for _,candidate in ipairs(candidates) do
-                local direction=candidate.direction
-                local safety=risk(direction)+terrain(direction)
-                -- Safety first; among safe moves prefer the shortest displacement.
-                local turn=lastDirection.Magnitude>.01 and direction.Magnitude>.01
-                    and (1-lastDirection.Unit:Dot(direction.Unit))*.05 or 0
-                local progress=desired.Magnitude>.01 and desired.Unit:Dot(direction) or 0
-                local score=safety+candidate.distance*.1+direction.Magnitude*.05+turn
-                -- Reward forward progress only for a completely safe candidate.
-                if safety==0 then score-=math.max(0,progress)*8 end
-                if score<bestScore then chosen=direction;bestScore=score end
-            end
-            evading=true
-        end
-        -- The game checks both cross and expanding-ring damage only near ground level.
-        -- Both use the normal jump while preserving the attack approach; holes/arm strikes still steer.
-        local jump=false
-        if #jumping>0 then
-            local power=hum.UseJumpPower and hum.JumpPower or math.sqrt(2*workspace.Gravity*hum.JumpHeight)
-            -- Wait until the band is close enough to cross near the jump apex.
-            -- Using the whole 0.55 second movement horizon can land inside a ring.
-            local lead=grounded and math.clamp(power/math.max(workspace.Gravity,1)*.4,.06,.12) or nil
-            local standingRisk=evaluate(position,chosen,speed,jumping,nil,nil,vertical,grounded,horizontal,lead)
-            if standingRisk>0 then
-                evading=true
-                if grounded and now>=nextJump then
-                    local airborneRisk=evaluate(position,chosen,speed,jumping,nil,power,vertical,grounded,horizontal)
-                    if airborneRisk<standingRisk then
-                        jump=true
-                        nextJump=now+.15
-                    end
-                end
-            end
-        end
-        lastDirection=chosen
-        return chosen,jump,evading
-    end
-    local function reset()
-        samples=setmetatable({},{__mode="k"})
-        lastDirection=Vector3.zero;nextJump=0
-    end
-    return {steer=steer,evaluate=evaluate,reset=reset}
-end
-
-
-local function createBossHop(report)
-    type BossHopState = {
-        armed: boolean, attempts: number, visited: {[string]: boolean}, expires: number,
-        destination: string?, from: string?, arrived: string?, origin: string?,
-        round: number?, exhausted: boolean?,
-    }
-    local function readHopState(value: unknown): BossHopState?
-        if type(value)~="table" then return nil end
-        local data=value :: {[string]: unknown}
-        local expires=data.expires
-        if type(expires)~="number" or expires~=expires or expires==math.huge or expires<=os.time()
-            or type(data.visited)~="table" then return nil end
-        local visited: {[string]: boolean}={}
-        for id,on in pairs(data.visited) do
-            if type(id)=="string" and on==true then visited[id]=true end
-        end
-        local attempts=type(data.attempts)=="number" and data.attempts or 0
-        if attempts~=attempts or math.abs(attempts)==math.huge then attempts=0 end
-        return {
-            armed=data.armed==true,attempts=math.clamp(math.floor(attempts),0,3),visited=visited,expires=expires,
-            destination=type(data.destination)=="string" and data.destination or nil,
-            from=type(data.from)=="string" and data.from or nil,
-            arrived=type(data.arrived)=="string" and data.arrived or nil,
-            origin=type(data.origin)=="string" and data.origin or nil,
-            round=type(data.round)=="number" and data.round or nil,
-            exhausted=data.exhausted==true,
-        }
-    end
-    local Http=game:GetService("HttpService")
-    local Teleport=game:GetService("TeleportService")
-    local path="EggAtlas-Hop-"..game.PlaceId.."-"..player.UserId..".json"
-    local sourcePath="EggAtlas-Core-"..game.PlaceId.."-"..player.UserId..".luau"
-    local api={enabled=configStore.data.bossHop==true,busy=false}
-    local state: BossHopState={armed=false,attempts=0,visited={},expires=0}
-    local readyAt=os.clock()+12
-    local queued=false
-    local failed=nil
-    local function status(phase,message)
-        gui:SetAttribute("BossHopStatus",phase)
-        gui:SetAttribute("BossHopMessage",message)
-        print("BOSS_HOP",phase,message)
-        report(phase,message)
-    end
-    local function save()
-        if type(writefile)=="function" then return pcall(writefile,path,Http:JSONEncode(state)) end
-        return false,"File saving is unavailable"
-    end
-    if type(readfile)=="function" then
-        local ok,value=pcall(function()return Http:JSONDecode(readfile(path))end)
-        local restored=ok and readHopState(value) or nil
-        if restored then
-            state=restored
-            if state.destination==game.JobId then
-                state.arrived=game.JobId;state.destination=nil;save()
-                gui:SetAttribute("BossHopArrival",game.JobId)
-                print("BOSS_HOP_ARRIVED",state.from,game.JobId,state.attempts)
-            end
+    function api.addDrops(drops)
+        for _,drop in ipairs(drops or {}) do
+            if type(drop.Id)=="string" and (drop.OwnerUserId==nil or drop.OwnerUserId==owner) then api.drops[drop.Id]=drop end
         end
     end
-    if not api.enabled then state.armed=false;save() end
-    api.waiting=state.exhausted==true
-    gui:SetAttribute("BossHopAttempts",state.attempts)
-    function api.setEnabled(on)
-        api.enabled=on==true
-        rememberToggle("bossHop",api.enabled)
-        gui:SetAttribute("BossHopEnabled",api.enabled)
-        print("BOSS_HOP_TOGGLE",api.enabled,game.JobId)
-        if not api.enabled then state.armed=false;save() end
-    end
-    function api.arm(round)
-        if not api.enabled then return end
-        state={armed=true,attempts=0,visited={[game.JobId]=true},expires=os.time()+1200,round=round,origin=game.JobId}
-        readyAt=os.clock()+1;api.waiting=false
-        gui:SetAttribute("BossHopAttempts",0)
-        local ok,err=save()
-        print("BOSS_HOP_ARMED",round,game.JobId,ok)
-        if not ok then state.armed=false;status("Hop unavailable",tostring(err)) end
-    end
-    function api.cancelSearch()
-        state.armed=false;save()
-    end
-    function api.pending()
-        return api.enabled and state.armed==true and state.expires>os.time()
-    end
-    function api.ready()return api.pending() and os.clock()>=readyAt end
-    connect(Teleport.TeleportInitFailed,function(who,_,message)
-        if who==player and api.busy then failed=tostring(message);status("Teleport failed",failed) end
-    end)
-    function api.run(cancelled)
-        if not api.ready() then return false end
-        if state.attempts>=3 then
-            state.exhausted=true;api.waiting=true
-            api.cancelSearch();status("Waiting","No available boss found after 3 hop attempts. Staying here until the next boss portal opens; your toggles stay ON.");return false
+    function api.apply(value)
+        if type(value)~="table" or type(value.Revision)~="number" then return end
+        if value.Drones then api.applyDrones(value.Drones) end
+        if not value.Patch and value.Revision>api.fullRevision then
+            api.fullRevision=value.Revision
+            api.snapshot=table.clone(value)
+            api.addDrops(value.Drops)
         end
-        local queue=queue_on_teleport or queueonteleport
-        local requestFn=request or http_request
-        if type(queue)~="function" or type(requestFn)~="function" or type(readfile)~="function" or type(writefile)~="function" then
-            status("Hop unavailable","Server Hop needs HTTP, file saving and queue-on-teleport support.")
-            readyAt=os.clock()+30;return false
+        if value.Revision>api.stateRevision then
+            api.stateRevision=value.Revision
+            api.latestState={State=value.State,Ready=value.Ready}
         end
-        local sourceOK,source=pcall(readfile,sourcePath)
-        if not sourceOK or type(source)~="string" or not loadstring(source) then
-            status("Hop unavailable","Run the complete installer script once so it can resume after joining.")
-            readyAt=os.clock()+30;return false
-        end
-        api.busy=true;failed=nil
-        local ok,err=pcall(function()
-            status("Finding server","Searching public servers after the confirmed boss defeat.")
-            local cursor=nil
-            local candidate=nil
-            for _=1,3 do
-                if cancelled() or not api.pending() then return end
-                local url="https://games.roblox.com/v1/games/"..game.PlaceId.."/servers/Public?sortOrder=Asc&limit=100&excludeFullGames=true"
-                if cursor then url..="&cursor="..Http:UrlEncode(cursor) end
-                local response=requestFn({Url=url,Method="GET"})
-                assert(type(response)=="table" and response.StatusCode==200,"Server list unavailable: "..tostring(response and response.StatusCode))
-                local data=Http:JSONDecode(response.Body)
-                local choices={}
-                for _,server in ipairs(data.data or {}) do
-                    if type(server.id)=="string" and server.id~=game.JobId and not state.visited[server.id]
-                        and type(server.playing)=="number" and type(server.maxPlayers)=="number" and server.playing<server.maxPlayers then table.insert(choices,server) end
-                end
-                if #choices>0 then candidate=choices[math.random(1,#choices)].id;break end
-                cursor=data.nextPageCursor
-                if not cursor then break end
-            end
-            assert(candidate,"No unvisited server with a free slot was found")
-            if cancelled() or not api.pending() then return end
-            configStore.request();configStore.flush()
-            state.visited[game.JobId]=true;state.visited[candidate]=true;state.attempts+=1
-            state.from=game.JobId;state.destination=candidate
-            gui:SetAttribute("BossHopAttempts",state.attempts)
-            assert(save(),"Could not save the server-search state")
-            if not queued then
-                local bootstrap="if game.PlaceId ~= 107778070777162 then return end; if not game:IsLoaded() then game.Loaded:Wait() end; local env=getgenv(); if env.EggAtlasAutoLaunchJob~=game.JobId then local f,e=loadstring(readfile("..string.format("%q",sourcePath)..")); assert(f,e); env.EggAtlasAutoLaunchJob=game.JobId; local ok,err=pcall(f); if not ok then env.EggAtlasAutoLaunchJob=nil; local ticket=env.EggAtlasLaunch; if ticket and ticket.job==game.JobId and ticket.loading then env.EggAtlasLaunch=nil end; warn('EGG_ATLAS_RESUME_ERROR',err) end end"
-                queue(bootstrap);queued=true
-            end
-            if cancelled() or not api.pending() then return end
-            status("Hopping","Joining server "..state.attempts.." / 3; checking the boss and entrance after joining.")
-            Teleport:TeleportToPlaceInstance(game.PlaceId,candidate,player)
-            local deadline=os.clock()+30
-            repeat
-                if failed then error(failed,0) end
-                if cancelled() then return end
-                task.wait(.2)
-            until os.clock()>=deadline
-            error("Teleport did not complete; waiting before trying another server",0)
-        end)
-        api.busy=false;readyAt=os.clock()+15
-        if not ok and alive then status("Hop retry",tostring(err)) end
-        return ok
+        if api.snapshot and api.latestState then api.snapshot.State=api.latestState.State;api.snapshot.Ready=api.latestState.Ready end
     end
-    gui:SetAttribute("BossHopEnabled",api.enabled)
+    function api.active(now)
+        local s=api.snapshot
+        return s~=nil and s.Ready==true and s.Enabled==true and s.WorldReady==true
+            and type(s.EventEndsAt)=="number" and now<s.EventEndsAt
+            and type(s.Window)=="table" and s.Window.Active==true
+            and type(s.Window.EndsAt)=="number" and now<s.Window.EndsAt
+    end
     return api
 end
 
-
-local function createBossController(page)
-    type BossSnapshot = {
-        Open: boolean?, OpensAt: number?, ClosesAt: number?,
-        BossHealth: number?, BossMaxHealth: number?,
-    }
-    local function readBossSnapshot(value: unknown): BossSnapshot?
-        if type(value)~="table" then return nil end
-        local data=value :: {[string]: unknown}
-        local function finite(value: unknown): number?
-            if type(value)=="number" and value==value and math.abs(value)<math.huge then return value end
-            return nil
-        end
-        local open: boolean?=nil
-        if type(data.Open)=="boolean" then open=data.Open end
-        return {
-            Open=open,
-            OpensAt=finite(data.OpensAt),ClosesAt=finite(data.ClosesAt),
-            BossHealth=finite(data.BossHealth),BossMaxHealth=finite(data.BossMaxHealth),
-        }
-    end
+local function createScrambleController(page)
+    local remotes=require(RS.Shared.Remotes).Scramble
+    local Motion=require(RS.Shared.Util.ScrambleDroneMotion)
     local Run=game:GetService("RunService")
-    local Remotes=require(RS.Shared.Remotes).BossEvent
-    local Ragdoll=require(RS.Shared.Modules.Ragdoll)
-    local Gears=require(RS.Data.Gears)
-    local controls=require(player.PlayerScripts.PlayerModule):GetControls()
-    local api={enabled=false,busy=false,evading=false,phase="Off",message="",rounds=0}
-    local snapshot: BossSnapshot={}
-    local healthRevision=0
-    local finishedRound=nil
-    local activeRound=nil
+    local model=createScrambleModel(player.UserId)
+    local view=UI.CreateEventWidgets(page)
+    local api={enabled=false,busy=false,phase="Off",message=""}
     local disposed=false
-    local ownedControls=false
-    local controlledHumanoid=nil
-    local lastSwing=0
+    local cancelled=false
     local nextAttempt=0
-    local interrupted=false
-    local exiting=false
-    local moveGoal=nil
-    local navigation=createBossNavigation()
-    local evasion=createBossEvasion(navigation)
-    local lastPosition=nil
-    local stuckSince=os.clock()
-    local bossView=UI.CreateBossWidgets(page)
-    local sw=bossView.sw
-    local dot=bossView.dot
-    local stateText=bossView.stateText
-    local detail=bossView.detail
-    local hpText=bossView.hpText
-    local timeText=bossView.timeText
-    local countText=bossView.countText
-    local hopSwitch=bossView.hopSwitch
-    local hopDot=bossView.hopDot
-    local hopInfo=bossView.hopInfo
-    local function say(phase,message)
-        api.phase,api.message=phase,message
-        if disposed or not alive then return end
-        if api.busy then gui:SetAttribute("WaitReason",phase=="Waiting" and message or nil)end
-        stateText.Text=string.upper(phase);detail.Text=message
-        gui:SetAttribute("BossPhase",phase);gui:SetAttribute("BossMessage",message)
-    end
-    local hop=createBossHop(say)
-    local function observeDefeat(health)
-        if disposed or not alive or not activeRound or finishedRound==activeRound or type(health)~="number" or health>0 then return end
-        finishedRound=activeRound
-        api.rounds+=1
-        countText.Text=tostring(api.rounds).." boss defeats observed this session"
-        gui:SetAttribute("BossDefeats",api.rounds)
-        gui:SetAttribute("BossLastOutcome","Defeated")
-        recordEvent("boss","Boss defeated / returning through the exit")
-        hop.arm(activeRound)
-    end
-    local function paintHop()
-        hopSwitch:SetAttribute("On",hop.enabled)
-        TweenService:Create(hopSwitch,TweenInfo.new(.18),{BackgroundColor3=hop.enabled and Color3.fromRGB(52,199,89) or Color3.fromRGB(67,76,91)}):Play()
-        TweenService:Create(hopDot,TweenInfo.new(.18),{Position=UDim2.fromOffset(hop.enabled and 31 or 3,3)}):Play()
-    end
-    connect(hopSwitch.Activated,function()hop.setEnabled(not hop.enabled);paintHop()end)
-    paintHop()
+    local eventRevision=0
+    local delayed={}
+    local motionCache={}
+    local fetching=false
+    local lastFetch=-math.huge
+    local startSamples=nil
     local function character()
         local ch=player.Character
         local hum=ch and ch:FindFirstChildOfClass("Humanoid")
         local root=ch and ch:FindFirstChild("HumanoidRootPart")
-        if hum and hum.Health>0 and root and root:IsA("BasePart") then return ch,hum,root end
-        return nil,nil,nil
-    end
-    local function inside()return player:GetAttribute("InBossArena")==true end
-    local function flat(v)return Vector3.new(v.X,0,v.Z)end
-    local function roundKey()return snapshot.OpensAt end
-    local function entrance()
-        local model=workspace:FindFirstChild("BossArenaTeleport")
-        local hitbox=model and model:FindFirstChild("Hitbox")
-        if hitbox and hitbox:IsA("BasePart") then return hitbox end
+        if hum and hum.Health>0 and root then return root end
         return nil
     end
-    local function canEnter()
-        return api.enabled and not inside() and snapshot.Open==true and roundKey()~=nil
-            and roundKey()~=finishedRound and (type(snapshot.BossHealth)=="number" and snapshot.BossHealth>0)
-            and (type(snapshot.ClosesAt)~="number" or workspace:GetServerTimeNow()<snapshot.ClosesAt)
-            and entrance()~=nil
+    local function position(drone)
+        local attrs=drone.Attributes or {}
+        local encoded=attrs.DroneMotion
+        local cached=motionCache[drone.Id]
+        if not cached or cached.encoded~=encoded then
+            local ok,value=pcall(Motion.Decode,encoded)
+            cached={encoded=encoded,value=ok and value or nil};motionCache[drone.Id]=cached
+        end
+        local motion=cached.value
+        if motion then
+            local alpha=math.clamp((workspace:GetServerTimeNow()-motion.At)/math.max(motion.Duration,.001),0,1)
+            if motion.Name=="Knockback" then alpha=alpha*alpha*(3-2*alpha) end
+            return motion.From:Lerp(motion.To,alpha).Position
+        end
+        return typeof(drone.CFrame)=="CFrame" and drone.CFrame.Position or nil
+    end
+    local function target()
+        local root=character()
+        if not root then return nil end
+        local best,score=nil,math.huge
+        local now=workspace:GetServerTimeNow()
+        for id,drone in pairs(model.drones) do
+            if type(drone.Health)=="number" and drone.Health>0 and (not drone.ExpiresAt or now<drone.ExpiresAt)
+                and os.clock()>=(delayed[id] or 0) then
+                local p=position(drone)
+                if p then
+                    local distance=(p-root.Position).Magnitude
+                    if distance<score then best,score=drone,distance end
+                end
+            end
+        end
+        return best
+    end
+    local function groundDrop()
+        local root=character()
+        if not root then return nil end
+        local best,distance=nil,math.huge
+        local now=workspace:GetServerTimeNow()
+        for id,drop in pairs(model.drops) do
+            if type(drop.ExpiresAt)~="number" or drop.ExpiresAt<=now then model.drops[id]=nil
+            elseif not drop.MagnetAt and typeof(drop.Position)=="Vector3" and os.clock()>=(delayed[id] or 0) then
+                local d=(drop.Position-root.Position).Magnitude
+                if d<distance then best,distance=drop,d end
+            end
+        end
+        return best
+    end
+    local function say(phase,message)
+        api.phase,api.message=phase,message
+        if not alive or disposed then return end
+        view.stateText.Text=string.upper(phase);view.detail.Text=message
+        gui:SetAttribute("EventPhase",phase);gui:SetAttribute("EventMessage",message)
+        if api.busy then gui:SetAttribute("WaitReason",phase=="Waiting" and message or nil) end
     end
     function api.hasOpportunity(): boolean
-        return api.enabled and not disposed and os.clock()>=nextAttempt and (inside() or canEnter()
-            or ((snapshot.Open==false or type(snapshot.BossHealth)=="number") and hop.ready()))
+        return api.enabled and not disposed and not cancelled and not manualStarting and not player:GetAttribute("InBossArena")
+            and os.clock()>=nextAttempt and model.active(workspace:GetServerTimeNow()) and (target()~=nil or groundDrop()~=nil)
     end
     local function check()
-        if disposed or not alive or interrupted then error("BOSS_CANCELLED",0) end
+        if not alive or disposed or cancelled or not api.enabled then error("EVENT_CANCELLED",0) end
     end
-    local function halt()
-        moveGoal=nil
-        if controlledHumanoid and controlledHumanoid.Parent then controlledHumanoid:Move(Vector3.zero,false) end
-    end
-    local function releaseControls()
-        halt()
-        exiting=false
-        api.evading=false
-        if alive and not disposed then gui:SetAttribute("BossEvading",false) end
-        if ownedControls then controls:Enable();ownedControls=false end
-        controlledHumanoid=nil
-    end
-    local function acquireControls(hum)
-        if controlledHumanoid~=hum then
-            halt();navigation.reset();evasion.reset()
-            controlledHumanoid=hum;lastPosition=nil;stuckSince=os.clock();lastSwing=0
+    local function fetch()
+        if fetching then return end
+        fetching=true;lastFetch=os.clock()
+        local revision=eventRevision
+        local ok,value=pcall(function()return remotes.Request:InvokeServer("Snapshot")end)
+        fetching=false
+        if not disposed and alive and ok and type(value)=="table" then
+            -- Revisions protect state/drones. Drops have no revision, so a newer
+            -- removal must win over an older in-flight snapshot of those drops.
+            if revision~=eventRevision then value=table.clone(value);value.Drops=nil end
+            model.apply(value)
         end
-        if not ownedControls then controls:Disable();ownedControls=true end
-    end
-    local function closest(part,position)
-        local p=part.CFrame:PointToObjectSpace(position)
-        local h=part.Size*.5
-        return part.CFrame:PointToWorldSpace(Vector3.new(math.clamp(p.X,-h.X,h.X),math.clamp(p.Y,-h.Y,h.Y),math.clamp(p.Z,-h.Z,h.Z)))
-    end
-    -- The arena floor is open. Move continuously; only brake at the target's edge.
-    -- No CFrame/WalkSpeed changes, input simulation or changes to game hazards.
-    connect(Run.PreSimulation,function(dt)
-        if not api.busy or not ownedControls or not alive or disposed then return end
-        local ch,hum,root=character()
-        if not ch or hum~=controlledHumanoid then halt();return end
-        if not inside() or Ragdoll.IsRagdolled(ch) or root.Anchored then hum:Move(Vector3.zero,false);return end
-        local direction=navigation.direction(root,hum,moveGoal)
-        local jump,evading
-        if exiting then
-            -- Exit navigation already checks the real floor and solid obstacles.
-            -- Do not let combat steering replace the locked portal crossing goal.
-            jump,evading=false,false
-        else direction,jump,evading=evasion.steer(root,hum,direction,dt) end
-        api.evading=evading
-        gui:SetAttribute("BossMoveGoal",moveGoal)
-        gui:SetAttribute("BossMoveDirection",direction)
-        gui:SetAttribute("BossEvading",evading)
-        if jump then hum.Jump=true end
-        if direction.Magnitude>.2 then
-            if not lastPosition or flat(root.Position-lastPosition).Magnitude>2 then lastPosition=root.Position;stuckSince=os.clock() end
-            if os.clock()-stuckSince>1.2 then hum.Jump=true;stuckSince=os.clock() end
-        else lastPosition=root.Position;stuckSince=os.clock() end
-        hum:Move(direction,false)
-    end)
-    local function bat(ch: Model): (Tool?,number)
-        local best: Tool?=nil
-        local bestRange=-1
-        for _,container in ipairs({ch,player:FindFirstChildOfClass("Backpack")}) do
-            for _,tool in ipairs(container:GetChildren()) do
-                if tool:IsA("Tool") and tool:GetAttribute("IsBat")==true then
-                    local cfg=Gears.Directory[tool:GetAttribute("GearName")]
-                    local data=cfg and cfg.BatControllerData
-                    local range=15+(data and data.RangeBonus or 0)
-                    if range>bestRange then best,bestRange=tool,range end
-                end
-            end
-        end
-        return best,bestRange
-    end
-    local function hitTarget(ch: Model,hum: Humanoid,root: BasePart,target: BasePart): ()
-        local tool,range=bat(ch)
-        if not tool then halt();say("No bat","Equip or obtain a Bat. Auto Boss will retry while this round is active.");return end
-        if tool.Parent~=ch then hum:EquipTool(tool) end
-        local edge=closest(target,root.Position)
-        local distance=(root.Position-edge).Magnitude
-        local inRange=distance<=math.max(4,range-2)
-        gui:SetAttribute("BossAttackTarget",target:GetFullName())
-        gui:SetAttribute("BossAttackDistance",distance)
-        local away=flat(root.Position-edge)
-        local offset=math.clamp(range*.35,3,9)
-        local goal=edge+(away.Magnitude>.01 and away.Unit or Vector3.xAxis)*offset
-        if not inRange and not navigation.supported(goal) then
-            -- A long arm hitbox may extend over the empty corners of the arena.
-            -- Find a supported point along another edge rather than chase empty space.
-            local half=target.Size*.5
-            local best,bestDistance=nil,math.huge
-            for _,side in ipairs({-1,1}) do
-                for _,fraction in ipairs({-1,-.5,0,.5,1}) do
-                    for _,localPoint in ipairs({Vector3.new(side*(half.X+offset),0,half.Z*fraction),Vector3.new(half.X*fraction,0,side*(half.Z+offset))}) do
-                        local candidate=target.CFrame:PointToWorldSpace(localPoint)
-                        local d=flat(candidate-root.Position).Magnitude
-                        if d<bestDistance and navigation.supported(candidate) then best,bestDistance=candidate,d end
-                    end
-                end
-            end
-            goal=best
-        end
-        if inRange then
-            moveGoal=nil
-        else
-            if not goal then moveGoal=nil;gui:SetAttribute("BossAttackStatus","No supported approach");return end
-            moveGoal=Vector3.new(goal.X,root.Position.Y,goal.Z)
-            gui:SetAttribute("BossAttackStatus","Approaching")
-            return
-        end
-        if Ragdoll.IsRagdolled(ch) then gui:SetAttribute("BossAttackStatus","Ragdolled");return end
-        if tool.Parent~=ch then gui:SetAttribute("BossAttackStatus","Equipping");return end
-        local untilTime=tool:GetAttribute("CooldownEndTime")
-        if tool:GetAttribute("CooldownActive")==true or (type(untilTime)=="number" and untilTime>workspace:GetServerTimeNow()) then gui:SetAttribute("BossAttackStatus","Cooldown");return end
-        if not tool.Enabled or os.clock()-lastSwing<.75 then gui:SetAttribute("BossAttackStatus","Cooldown");return end
-        lastSwing=os.clock()
-        gui:SetAttribute("BossAttackStatus","Swinging")
-        gui:SetAttribute("BossLastSwingAt",workspace:GetServerTimeNow())
-        tool:Activate()
-    end
-    local function leaveArena()
-        halt()
-        navigation.reset()
-        exiting=true
-        say("Leaving","Walking to the exit before resuming your enabled features.")
-        local selected: BasePart?=nil
-        local approach: Vector3?=nil
-        local through: Vector3?=nil
-        local stage="Approach"
-        local confirmUntil=0
-        local stalledAt,lastDistance=os.clock(),math.huge
-        local attemptSide: number?=nil
-        local function chooseApproach(hitbox: BasePart,root: BasePart,preferred: number?): (Vector3?,Vector3?,number?)
-            local localRoot=hitbox.CFrame:PointToObjectSpace(root.Position)
-            local side=preferred or (localRoot.Z>=0 and 1 or -1)
-            for _,candidate in ipairs({side,-side}) do
-                local before=hitbox.CFrame:PointToWorldSpace(Vector3.new(0,0,candidate*(hitbox.Size.Z*.5+13)))
-                local after=hitbox.CFrame:PointToWorldSpace(Vector3.new(0,0,-candidate*(hitbox.Size.Z*.5+5)))
-                before=Vector3.new(before.X,root.Position.Y,before.Z)
-                after=Vector3.new(after.X,root.Position.Y,after.Z)
-                if navigation.supported(before) and navigation.segment(before,after) then
-                    return before,after,candidate
-                end
-            end
-            return nil,nil,nil
-        end
-        while inside() do
-            check()
-            local _,hum,root=character()
-            local arena=workspace:FindFirstChild("BossArena")
-            local model=arena and arena:FindFirstChild("BossArenaLeaveTeleport")
-            local hitbox=model and model:FindFirstChild("Hitbox")
-            if hum and root and hitbox and hitbox:IsA("BasePart") then
-                acquireControls(hum)
-                if selected~=hitbox or not approach then
-                    approach,through,attemptSide=chooseApproach(hitbox,root,attemptSide)
-                    selected=hitbox;stage="Approach";navigation.reset()
-                    stalledAt,lastDistance=os.clock(),math.huge
-                    gui:SetAttribute("BossExitTarget",hitbox:GetFullName())
-                end
-                if not approach then
-                    halt();gui:SetAttribute("BossExitStage","No supported crossing")
-                    say("Exit blocked","Waiting for a supported route through RETURN TO LOBBY.")
-                    Run.Heartbeat:Wait();continue
-                end
-                if stage=="Approach" then
-                    moveGoal=approach
-                    if flat(root.Position-approach).Magnitude<=3 then stage="Crossing";moveGoal=through;navigation.reset();stalledAt,lastDistance=os.clock(),math.huge end
-                elseif stage=="Crossing" then
-                    -- Keep the same endpoint after crossing the trigger plane.
-                    moveGoal=through
-                    if flat(root.Position-through).Magnitude<=2 then stage="Confirming";confirmUntil=os.clock()+.8;halt() end
-                elseif os.clock()>=confirmUntil then
-                    stage="Approach";moveGoal=approach;navigation.reset();stalledAt,lastDistance=os.clock(),math.huge
-                else halt() end
-                if moveGoal then
-                    local distance=flat(root.Position-moveGoal).Magnitude
-                    if distance<lastDistance-.5 then lastDistance=distance;stalledAt=os.clock() end
-                    if os.clock()-stalledAt>2 then
-                        approach,through,attemptSide=chooseApproach(hitbox,root,-(attemptSide or 1))
-                        stage="Approach";moveGoal=approach;navigation.reset()
-                        stalledAt,lastDistance=os.clock(),math.huge
-                        say("Leaving","Exit route stalled; trying the other supported approach.")
-                    end
-                else stalledAt,lastDistance=os.clock(),math.huge end
-                gui:SetAttribute("BossExitStage",stage)
-                gui:SetAttribute("BossExitGoal",moveGoal)
-            else
-                halt();gui:SetAttribute("BossExitStage",hum and "Waiting for exit portal" or "Waiting for character")
-            end
-            Run.Heartbeat:Wait()
-        end
-        gui:SetAttribute("BossExitStage","Returned")
-        gui:SetAttribute("BossExitGoal",nil)
-        releaseControls()
-        local safe=runner.safeReturnPoint()
-        if safe then
-            say("Returning safely","Outside the boss arena; walking back across the safe boundary.")
-            runner.travel(safe,"Returning to Safe Zone after boss",function()
-                check()
-                if inside() then return "arena changed" end
-                return nil
-            end)
-        end
-    end
-    local function fight(key)
-        activeRound=key
-        gui:SetAttribute("BossLastOutcome","Fighting")
-        while inside() and api.enabled do
-            check()
-            if not key then key=roundKey();activeRound=key end
-            observeDefeat(snapshot.BossHealth)
-            if type(snapshot.BossHealth)=="number" and snapshot.BossHealth>0 and hop.pending() then hop.cancelSearch() end
-            if key~=nil and finishedRound==key then break end
-            if snapshot.Open==false or (type(snapshot.ClosesAt)=="number" and workspace:GetServerTimeNow()>snapshot.ClosesAt) then break end
-            local ch,hum,root=character()
-            if ch and hum and root then
-                acquireControls(hum)
-                local target,phase=bossTarget(workspace:FindFirstChild("BossArena"),root.Position)
-                if target then
-                    say(phase,phase=="Crystals" and "Breaking the nearest living crystal with your Bat." or "Hitting the exposed hand until the game closes this attack window.")
-                    hitTarget(ch,hum,root,target)
-                    if api.evading and gui:GetAttribute("BossAttackStatus")=="Approaching" then say("Dodging","Avoiding the incoming skill while approaching "..phase..".") end
-                else
-                    gui:SetAttribute("BossAttackStatus","Waiting for vulnerable target")
-                    gui:SetAttribute("BossAttackTarget",nil);gui:SetAttribute("BossAttackDistance",nil)
-                    moveGoal=nil;say(phase,"Watching the game's boss state; evasion remains active.")
-                end
-            else halt();say("Respawning","Waiting for your character; other features remain paused.") end
-            task.wait(.05)
-        end
-        if inside() then leaveArena() end
+        if not ok and not api.busy then say("Retrying","Event data unavailable; retrying while your toggle stays on.") end
     end
     local function run()
-        local key=roundKey()
-        say("Pausing","Pausing your current workflow. Accepted trades finish claiming first.")
-        local zones,exitPoint=riftController.pauseForBoss(function()check();return not api.enabled and not inside()end)
+        local zones,exitPoint=riftController.pauseForEvent(function()return disposed or not alive or cancelled or not api.enabled end)
         check()
-        gui:SetAttribute("AutomationOwner","Boss")
-        local function enterArena()
-            if not inside() and canEnter() then
-                local safe=runner.carriedReturnPoint()
-                if safe then
-                    say("Returning egg","Delivering the egg already in your hands before entering the boss portal.")
-                    runner.travel(safe,"Returning held egg before Auto Boss",function()check();return not api.enabled and "cancelled" or nil end,zones,exitPoint)
-                    exitPoint=nil
-                    local deadline=os.clock()+6
-                    while runner.carriedReturnPoint() and os.clock()<deadline do check();task.wait(.1) end
-                    assert(not runner.carriedReturnPoint(),"Held egg did not reach inventory; retrying before entering")
-                end
-                local portal=entrance()
-                if portal and canEnter() then
-                    say("Entering","Running through the boss entrance. Auto Area and The Rift are paused.")
-                    local _,_,root=character()
-                    if not root then return end
-                    local p=portal.CFrame:PointToObjectSpace(root.Position)
-                    local through=portal.CFrame:PointToWorldSpace(Vector3.new(0,0,p.Z>=0 and -6 or 6))
-                    runner.travel(through,"Entering boss portal",function()
-                        check()
-                        if inside() then return "entered" end
-                        if not canEnter() or entrance()~=portal then return "portal unavailable" end
-                        return nil
-                    end,zones,exitPoint,portal)
-                    exitPoint=nil
-                    local deadline=os.clock()+2
-                    while not inside() and canEnter() and os.clock()<deadline do check();task.wait(.05) end
-                end
-            end
+        local safe=runner.carriedReturnPoint()
+        if safe then
+            say("Returning","Delivering the held egg before collecting Samples.")
+            runner.travel(safe,"Delivering the held egg before DR Scramble",function()check();return nil end,zones,exitPoint)
+            exitPoint=nil
+            local deadline=os.clock()+6
+            while runner.carriedReturnPoint() and os.clock()<deadline do check();Run.Heartbeat:Wait() end
+            assert(not runner.carriedReturnPoint(),"Waiting for the held egg to reach inventory")
         end
-        while api.enabled and (inside() or canEnter()) do
+        while model.active(workspace:GetServerTimeNow()) do
             check()
-            local ch,hum=character()
-            if not ch then
-                halt();navigation.reset();evasion.reset()
-                say("Respawning","Waiting for your character, then returning to this boss. Other features remain paused.")
-                Run.Heartbeat:Wait()
-            elseif inside() then
-                fight(key)
-            else
-                -- Death can clear InBossArena before CharacterAdded. Keep ownership
-                -- and re-enter as soon as the new humanoid and portal are available.
-                releaseControls();navigation.reset();evasion.reset()
-                local ok,err=pcall(enterArena)
-                if not ok then
-                    check()
-                    local current,currentHum=character()
-                    if current and currentHum==hum then error(err,0) end
+            if higherPriorityWork("Event") then break end
+            local drop=groundDrop()
+            local drone=target()
+            if not drop and not drone then break end
+            local id=drop and drop.Id or drone.Id
+            local lastHealth=drone and drone.Health
+            local progressAt=os.clock()
+            local begun=os.clock()
+            local label=drop and "Collecting dropped Samples / parts" or ("Following "..tostring((drone.Attributes or {}).ScrambleTier).." / "..tostring((drone.Attributes or {}).ScrambleArea))
+            say(drop and "Collecting" or "Hunting",label)
+            local ok,err=pcall(function()
+                if exitPoint then
+                    runner.travel(exitPoint,"Leaving the treadmill for DR Scramble",function()check();return nil end,zones,exitPoint)
+                    exitPoint=nil
                 end
-                if not inside() then Run.Heartbeat:Wait() end
-            end
+                runner.follow(function()
+                    check()
+                    if not model.active(workspace:GetServerTimeNow()) or higherPriorityWork("Event") then return nil end
+                    if drop then
+                        local current=model.drops[id]
+                        if not current or workspace:GetServerTimeNow()>=current.ExpiresAt then return nil end
+                        if os.clock()-begun>6 then delayed[id]=os.clock()+8;return nil end
+                        return current.Position,Vector3.zero,math.max(.5,math.min((current.Radius or 3)*.35,2))
+                    end
+                    local current=model.drones[id]
+                    if not current or current.Health<=0 then return nil end
+                    if current.Health~=lastHealth then lastHealth=current.Health;progressAt=os.clock() end
+                    if os.clock()-progressAt>25 then delayed[id]=os.clock()+12;return nil end
+                    local p=position(current)
+                    if not p then return nil end
+                    local root=character()
+                    return Vector3.new(p.X,root and root.Position.Y or p.Y,p.Z),Vector3.zero,6
+                end,label,zones)
+            end)
+            check()
+            if not ok then delayed[id]=os.clock()+12;say("Retrying",tostring(err).." / trying another reachable target") end
+            -- The game's client collects magnetized rewards itself. Do not send duplicate collect requests.
+            local untilTime=os.clock()+.35
+            repeat check();Run.Heartbeat:Wait() until os.clock()>=untilTime
         end
-        if inside() then leaveArena() end
+        check()
+        local safePoint=runner.safeReturnPoint()
+        if safePoint then
+            say("Returning","Returning safely; your enabled features resume next.")
+            runner.travel(safePoint,"Returning from DR Scramble",function()check();return nil end,zones)
+        end
     end
-
     function api.setEnabled(on)
-        api.enabled=on==true
-        if not restoringConfig then rememberToggle("autoBoss",api.enabled) end
-        sw:SetAttribute("On",api.enabled);gui:SetAttribute("BossEnabled",api.enabled)
-        TweenService:Create(sw,TweenInfo.new(.18),{BackgroundColor3=api.enabled and Color3.fromRGB(52,199,89) or Color3.fromRGB(67,76,91)}):Play()
-        TweenService:Create(dot,TweenInfo.new(.18),{Position=UDim2.fromOffset(api.enabled and 31 or 3,3)}):Play()
-        if not api.busy then say(api.enabled and "Waiting" or "Off",api.enabled and "Your other features keep working until the boss entrance opens." or "Auto Boss is off.") end
+        api.enabled=on==true;cancelled=not api.enabled
+        if not restoringConfig then rememberToggle("autoEvent",api.enabled) end
+        view.sw:SetAttribute("On",api.enabled);gui:SetAttribute("EventEnabled",api.enabled)
+        TweenService:Create(view.sw,TweenInfo.new(.18),{BackgroundColor3=api.enabled and Color3.fromRGB(52,199,89) or Color3.fromRGB(67,76,91)}):Play()
+        TweenService:Create(view.dot,TweenInfo.new(.18),{Position=UDim2.fromOffset(api.enabled and 31 or 3,3)}):Play()
+        if not api.enabled and api.busy and runner.active then runner.stop("DR Scramble disabled") end
+        if not api.busy then say(api.enabled and "Waiting" or "Off",api.enabled and "Other features continue until your personal drones appear." or "DR Scramble automation is off.") end
     end
     function api.destroy()
-        disposed=true;interrupted=true;api.enabled=false
-        navigation.destroy()
-        releaseControls()
-        if api.busy and runner.active then runner.stop("Auto Boss closed") end
+        disposed=true;cancelled=true;api.enabled=false
+        if api.busy and runner.active then runner.stop("DR Scramble closed") end
+        table.clear(model.drones);table.clear(model.drops);table.clear(motionCache)
     end
-    connect(sw.Activated,function()api.setEnabled(not api.enabled)end)
-    connect(Remotes.StateShifted.OnClientEvent,function(value)
-        local nextSnapshot=readBossSnapshot(value)
-        if nextSnapshot then snapshot=nextSnapshot;healthRevision+=1;observeDefeat(snapshot.BossHealth) end
+    connect(view.sw.Activated,function()api.setEnabled(not api.enabled)end)
+    connect(remotes.State.OnClientEvent,function(value)eventRevision+=1;model.apply(value);eggRevision+=1 end)
+    connect(remotes.Drones.OnClientEvent,function(value)
+        eventRevision+=1
+        model.applyDrones(value)
+        for id in pairs(motionCache) do if not model.drones[id] then motionCache[id]=nil end end
     end)
-    connect(Remotes.HealthShifted.OnClientEvent,function(health,maximum)
-        local nextSnapshot=readBossSnapshot({BossHealth=health,BossMaxHealth=maximum})
-        if not nextSnapshot or nextSnapshot.BossHealth==nil then return end
-        snapshot.BossHealth=nextSnapshot.BossHealth;snapshot.BossMaxHealth=nextSnapshot.BossMaxHealth;healthRevision+=1
-        -- Latch this event before a round-close snapshot can replace the health field.
-        observeDefeat(snapshot.BossHealth)
-    end)
+    connect(remotes.Drops.OnClientEvent,function(value)eventRevision+=1;model.addDrops(value)end)
+    connect(remotes.RemoveDrops.OnClientEvent,function(ids)eventRevision+=1;for _,id in ipairs(ids)do model.drops[id]=nil end end)
     connect(Input.InputBegan,function(input)
         if not api.busy or Input:GetFocusedTextBox() then return end
         local k=input.KeyCode
         if k==Enum.KeyCode.W or k==Enum.KeyCode.A or k==Enum.KeyCode.S or k==Enum.KeyCode.D or k==Enum.KeyCode.Escape
-            or k==Enum.KeyCode.Up or k==Enum.KeyCode.Down or k==Enum.KeyCode.Left or k==Enum.KeyCode.Right then
-            interrupted=true;api.setEnabled(false);releaseControls()
-            if runner.active then runner.stop("Auto Boss stopped by keyboard") end
-        end
+            or k==Enum.KeyCode.Up or k==Enum.KeyCode.Down or k==Enum.KeyCode.Left or k==Enum.KeyCode.Right then api.setEnabled(false) end
+    end)
+    local nextPaint=0
+    connect(Run.Heartbeat,function()
+        if disposed or os.clock()<nextPaint then return end
+        nextPaint=os.clock()+.2
+        if not fetching and os.clock()-lastFetch>=5 then task.spawn(fetch) end
+        local ok,err=pcall(function()
+                local s=model.snapshot
+                if s then
+                    local state=s.State or {}
+                    local samples=state.Samples or 0
+                    startSamples=startSamples or samples
+                    view.samples.Text=compact(samples).." SAMPLES"
+                    view.parts.Text=tostring(state.TotalParts or 0).." / 5 parts"
+                    local count=0;for _,d in pairs(model.drones)do if d.Health>0 then count+=1 end end
+                    view.targets.Text=tostring(count).." personal drones"
+                    local active=model.active(workspace:GetServerTimeNow())
+                    local boundary=s.Window and (active and s.Window.EndsAt or s.Window.NextAt)
+                    local remaining=type(boundary)=="number" and math.max(0,math.ceil(boundary-workspace:GetServerTimeNow())) or 0
+                    view.timeText.Text=string.format(active and "ROUND ENDS  %02d:%02d" or "NEXT ROUND  %02d:%02d",remaining//60,remaining%60)
+                    gui:SetAttribute("EventSamples",samples);gui:SetAttribute("EventDrones",count)
+                    gui:SetAttribute("EventRoundActive",active)
+                    gui:SetAttribute("EventSamplesGained",math.max(0,samples-startSamples))
+                end
+        end)
+        if not ok and not api.busy then say("Retrying",tostring(err)) end
     end)
     task.spawn(function()
         while alive and not disposed do
-            local revision=healthRevision
-            local ok,value=pcall(function()return Remotes.AskSnapshot:InvokeServer()end)
-            -- An event received during this request is newer than its response.
-            local nextSnapshot=ok and readBossSnapshot(value) or nil
-            if alive and not disposed and nextSnapshot and revision==healthRevision then snapshot=nextSnapshot;observeDefeat(snapshot.BossHealth) end
-            task.wait(10)
-        end
-    end)
-    task.spawn(function()
-        while alive and not disposed do
-            if not restoringConfig and os.clock()>=nextAttempt and api.enabled and not api.busy and not inside() and not higherPriorityWork("Boss") and (snapshot.Open==false or type(snapshot.BossHealth)=="number") and hop.ready() then
-                api.busy=true;interrupted=false;gui:SetAttribute("BossBusy",true)
-                local hopOK,hopError=pcall(function()
-                    riftController.pauseForBoss(function()return disposed or not alive or not api.enabled or not hop.pending()end)
-                    local safe=runner.carriedReturnPoint()
-                    if safe then runner.travel(safe,"Returning held egg before Server Hop",function()check();return nil end) end
-                    assert(not runner.carriedReturnPoint(),"Held egg has not reached inventory yet")
-                    -- A portal can open while returning an egg or fetching the server list.
-                    -- Recheck immediately before teleporting so a usable local boss wins.
-                    hop.run(function()return disposed or not alive or interrupted or not api.enabled or inside() or canEnter() end)
-                end)
-                api.busy=false
-                if alive and not disposed then
-                    gui:SetAttribute("BossBusy",false);riftController.resumeAfterBoss()
-                    if not hopOK then say("Hop retry",tostring(hopError));nextAttempt=os.clock()+5 end
+            local ok,err=pcall(function()
+                if not restoringConfig and not api.busy and api.hasOpportunity() and not higherPriorityWork("Event") then
+                    api.busy=true;cancelled=false;gui:SetAttribute("EventBusy",true);gui:SetAttribute("AutomationOwner","Event")
+                    local success,failure=pcall(run)
+                    if runner.active then runner.stop("DR Scramble trip finished") end
+                    api.busy=false
+                    if not alive or disposed then return end
+                    gui:SetAttribute("EventBusy",false);gui:SetAttribute("AutomationOwner",nil)
+                    riftController.resumeAfterEvent()
+                    nextAttempt=os.clock()+(success and .5 or 3)
+                    if not success and not cancelled then say("Retrying",tostring(failure).." / toggle stays on")
+                    else say(api.enabled and "Waiting" or "Off",api.enabled and "Other features resumed; waiting for personal drones or the next round." or "DR Scramble automation is off.") end
                 end
-            end
-            if not restoringConfig and os.clock()>=nextAttempt and not api.busy and api.enabled and (inside() or (canEnter() and not higherPriorityWork("Boss"))) then
-                api.busy=true;interrupted=false;gui:SetAttribute("BossBusy",true)
-                local ok,err=pcall(run)
-                -- An arena error keeps exclusive ownership until exit or explicit manual override.
-                while alive and not disposed and not interrupted and inside() do
-                    say("Recovering",tostring(err).." / Walking to the exit before resuming.")
-                    local left,leaveError=pcall(leaveArena)
-                    if not left then err=leaveError;task.wait(1) end
+            end)
+            if not ok and alive and not disposed then
+                if api.busy then
+                    if runner.active then runner.stop("Recovering DR Scramble") end
+                    api.busy=false;gui:SetAttribute("EventBusy",false)
+                    riftController.resumeAfterEvent()
                 end
-                releaseControls()
-                if activeRound and activeRound~=finishedRound and alive and not disposed then gui:SetAttribute("BossLastOutcome","Ended without confirmed defeat") end
-                activeRound=nil
-                api.busy=false
-                if alive and not disposed then
-                    gui:SetAttribute("BossBusy",false);gui:SetAttribute("AutomationOwner",nil)
-                    riftController.resumeAfterBoss()
-                    nextAttempt=os.clock()+(ok and 3 or 5)
-                    if not ok and not interrupted then say("Retrying",tostring(err))
-                    else say(api.enabled and "Waiting" or "Off",api.enabled and "Boss trip ended. Your enabled features resume; waiting for the next portal." or "Auto Boss is off.") end
-                end
+                say("Retrying",tostring(err));nextAttempt=os.clock()+3
             end
-            if alive and not disposed then
-                local hopReason
-                if not hop.enabled then hopReason="OFF / Enable HOP SERVER AFTER BOSS DEFEAT to search."
-                elseif not api.enabled then hopReason="PAUSED / Enable Auto Boss first."
-                elseif inside() and hop.pending() then hopReason="WAITING / Return through the lobby portal before hopping."
-                elseif hop.pending() then hopReason="SEARCH / "..tostring(gui:GetAttribute("BossHopAttempts") or 0).." of 3 attempts; checking boss and entrance."
-                elseif hop.waiting then hopReason="WAITING HERE / Search limit reached; waiting for the next boss portal. Toggles stay ON."
-                else hopReason="WAITING / A confirmed boss defeat starts the next search (limit 3)." end
-                hopInfo.Text=hopReason
-                gui:SetAttribute("BossHopWaitReason",hopReason)
-                hpText.Text="BOSS HP  /  "..(type(snapshot.BossHealth)=="number" and (compact(snapshot.BossHealth).." / "..compact(snapshot.BossMaxHealth)) or "--")
-                local boundary=snapshot.Open and snapshot.ClosesAt or snapshot.OpensAt
-                timeText.Text=type(boundary)=="number" and ((snapshot.Open and "Round closes in " or "Next opening in ")..math.max(0,math.ceil(boundary-workspace:GetServerTimeNow())).." s") or "Waiting for event state..."
-            end
-            task.wait(.1)
+            task.wait(.2)
         end
     end)
     api.setEnabled(false)
@@ -3475,7 +2587,7 @@ local function initializeRift()
         gui=gui,panel=panel,header=header,close=close,watchPanel=watchPanel,
         featureNav=featureNav,connect=connect,savedTab=configStore.data.tab,
     })
-    local page,overviewPage,bossPage=featurePages.page,featurePages.overviewPage,featurePages.bossPage
+    local page,overviewPage,eventPage=featurePages.page,featurePages.overviewPage,featurePages.eventPage
     local statsPage,indexPage=featurePages.statsPage,featurePages.indexPage
     sessionOverview=createOverviewPage(overviewPage)
     UI.CreatePriorityControls({order=priorities.order,connect=connect,shift=function(index,direction)
@@ -3486,7 +2598,7 @@ local function initializeRift()
         recordEvent("setting","Priority: "..table.concat(priorities.order," > "))
     end},overviewPage:FindFirstChild("OverviewPriority"))
     createEggStatsPage(statsPage)
-    local riftView=UI.CreateRiftWidgets(page)
+    local riftView=UI.CreateRiftWidgets(page,Rift.Banners)
     local banner=riftView.banner
     local timer=riftView.timer
     local odds=riftView.odds
@@ -3505,10 +2617,30 @@ local function initializeRift()
         retryAt=0,
         failures=0,
         tradeRecovery=configStore.data.pendingRiftTrade,
-        bossPaused=false,
+        eventPaused=false,
         commitToken=nil :: number?,
     }
     riftController=api
+    local wantedBanner=type(configStore.data.riftBanner)=="string" and configStore.data.riftBanner or "Any"
+    if wantedBanner~="Any" and not Rift.GetBanner(wantedBanner) then wantedBanner="Any" end
+    local function acceptsBanner(s)
+        return s~=nil and (wantedBanner=="Any" or s.BannerId==wantedBanner)
+    end
+    local function paintBannerChoice()
+        gui:SetAttribute("RiftWantedBanner",wantedBanner)
+        for id,choice in pairs(riftView.bannerButtons) do
+            choice.BackgroundColor3=id==wantedBanner and C.selected or C.card
+            choice.TextColor3=id==wantedBanner and C.mint or C.muted
+            choice:SetAttribute("Selected",id==wantedBanner)
+        end
+    end
+    paintBannerChoice()
+    for id,choice in pairs(riftView.bannerButtons) do
+        connect(choice.Activated,function()
+            wantedBanner=id;eggRevision+=1;paintBannerChoice()
+            configStore.request();configStore.flush()
+        end)
+    end
     local generation=0
     local schedulerRunning=false
     local ensureWorkflow
@@ -3668,7 +2800,7 @@ local function initializeRift()
         api.message=message
         if alive then
             local waiting=phase=="Waiting" or phase=="Training" or phase=="Loading" or phase=="Retrying"
-            if not (bossController and bossController.busy) then gui:SetAttribute("WaitReason",waiting and message or nil)end
+            if not (eventController and eventController.busy) then gui:SetAttribute("WaitReason",waiting and message or nil)end
             status.Text=string.upper(phase);detail.Text=message
             gui:SetAttribute("RiftPhase",phase);gui:SetAttribute("RiftMessage",message)
         end
@@ -3691,7 +2823,7 @@ local function initializeRift()
             return
         end
         generation+=1;api.active=false
-        if runner.active and not (bossController and bossController.busy) then runner.stop(reason or "Rift stopped") end
+        if runner.active and not (eventController and eventController.busy) then runner.stop(reason or "Rift stopped") end
         local ok,err=pcall(stopTraining)
         if not ok then reason=tostring(err) end
         if alive then switchOn(false);say("Stopped",reason or "Stopped. Your collected eggs and pets are kept.") end
@@ -3717,7 +2849,7 @@ local function initializeRift()
     end
     local function riftShouldYield()
         local owner=areaWatch.busy and "Area" or (indexWatch.busy and "Index" or "Rift")
-        return higherPriorityWork(owner) or (owner~="Area" and priorities.before("Area",owner) and reserveAreaReset())
+        return (owner=="Rift" and not acceptsBanner(liveState)) or higherPriorityWork(owner) or (owner~="Area" and priorities.before("Area",owner) and reserveAreaReset())
     end
     local function checkRiftPriority(token: number): ()
         check(token)
@@ -3806,6 +2938,7 @@ local function initializeRift()
         local s=liveState
         if not s or not s.Unlocked or #s.Requirements~=3 then return false end
         if s.PendingReward then return true end
+        if not acceptsBanner(s) then return false end
         if riftReadyRevision==eggRevision and os.clock()<riftReadyAt then return riftReadyValue end
         riftReadyAt=os.clock()+.15;riftReadyRevision=eggRevision;riftReadyValue=false
         local inputs=selectInputs(s.Requirements,Save.Get())
@@ -3822,7 +2955,7 @@ local function initializeRift()
     end
     featureReady=function(name: string): boolean
         local ok,ready=pcall(function()
-            if name=="Boss" then return bossController~=nil and bossController.hasOpportunity() end
+            if name=="Event" then return eventController~=nil and eventController.hasOpportunity() end
             if name=="Area" then return priorityEgg()~=nil end
             if name=="Index" then return indexJob()~=nil end
             if name=="Rift" then return riftWorkReady() end
@@ -3837,7 +2970,7 @@ local function initializeRift()
             local egg=priorityEgg();action=egg and ("Auto Area / "..egg.AssetCategory) or "Auto Area"
         elseif name=="Index" then
             local job=indexJob();action=job and ("Auto Index / "..job.kind.." / "..job.category) or "Auto Index"
-        elseif name=="Boss" then action="Auto Boss / enter the available encounter"
+        elseif name=="Event" then action="DR Scramble / collect Samples from personal drones"
         elseif name=="Rift" then action="The Rift / continue the current recipe" end
         gui:SetAttribute("NextAction",action)
         return name
@@ -3962,8 +3095,8 @@ local function initializeRift()
         hatchQueue.refresh()
         if api.finishIndexIfComplete() then return true end
         if priorityEgg() or indexJob() then return true end
-        if bossController and bossController.hasOpportunity() then return true end
-        if not api.active or not s then return false end
+        if eventController and eventController.hasOpportunity() then return true end
+        if not api.active or not s or not acceptsBanner(s) then return false end
         local inputs=selectInputs(s.Requirements,Save.Get())
         if inputs[1] and inputs[2] and inputs[3] then return true end
         for i,category in ipairs(s.Requirements) do
@@ -3980,9 +3113,10 @@ local function initializeRift()
         check(token)
         if waitingWorkReady(s) then return end
         local riftWasActive=api.active
+        local startingBanner=wantedBanner
         local reservedReset=reserveForRift()
         local function workChanged()
-            return api.active~=riftWasActive or waitingWorkReady(s)
+            return api.active~=riftWasActive or wantedBanner~=startingBanner or waitingWorkReady(s)
                 or reserveForRift()~=reservedReset
                 or (s and liveState and signature(liveState)~=signature(s))
         end
@@ -4002,7 +3136,7 @@ local function initializeRift()
             local function interrupt()
                 check(token)
                 if training.belt then return "training" end
-                if api.active~=riftWasActive or reserveForRift()~=reservedReset
+                if api.active~=riftWasActive or wantedBanner~=startingBanner or reserveForRift()~=reservedReset
                     or (s and liveState and signature(liveState)~=signature(s)) then return "work ready" end
                 if seenRevision~=eggRevision or os.clock()>=pollAt then
                     seenRevision=eggRevision
@@ -4168,7 +3302,8 @@ local function initializeRift()
         walk(token,Vector3.new(goal.X,root.Position.Y,goal.Z),"Bringing the three pets to The Rift")
         check(token)
         local fresh=fetch();check(token)
-        if signature(fresh)~=signature(s) then return false end
+        if signature(fresh)~=signature(s) or not acceptsBanner(fresh) then return false end
+        if wantedBanner~="Any" and (fresh.SecondsUntilRotation or 0)<=2 then pauseRift(token,.5);return false end
         assert(fresh.Unlocked==true,"The Rift is locked")
         assert(not fresh.PendingReward,"Claim the existing Rift reward before starting a new trade")
         local selected=selectInputs(fresh.Requirements,Save.Get())
@@ -4376,9 +3511,9 @@ local function initializeRift()
             check(token)
             hatchQueue.refresh()
             if api.finishIndexIfComplete() then continue end
-            if api.bossPaused then heartbeat:Wait();continue end
+            if api.eventPaused then heartbeat:Wait();continue end
             local nextFeature=chooseNextFeature()
-            if nextFeature=="Boss" then heartbeat:Wait();continue end
+            if nextFeature=="Event" then heartbeat:Wait();continue end
             if nextFeature=="Area" and runPriorityTrip(token) then continue end
             if nextFeature=="Index" and runIndexWork(token) then continue end
             if areaWatch.enabled then watchMessage("WAITING  /  "..areaWatch.area.." / "..areaWatch.rarity..(api.active and " / The Rift is working" or " / watching new spawns")) end
@@ -4395,6 +3530,10 @@ local function initializeRift()
             gui:SetAttribute("AutomationOwner","Rift")
             local s=nextState or fetch();nextState=nil
             check(token);updateUI()
+            if not acceptsBanner(s) and not s.PendingReward then
+                trainWhileWaiting(token,s,{"waiting for "..Rift.GetBannerDisplayName(wantedBanner).." banner; the server controls rotation"})
+                continue
+            end
             if riftShouldYield() then continue end
             assert(s.Unlocked==true,"The Rift needs "..compact(s.UnlockSpeedPower).." Speed")
             assert(#s.Requirements==3,"The current Rift recipe is incomplete")
@@ -4541,7 +3680,7 @@ local function initializeRift()
         return ok and ready==true
     end
     ensureWorkflow=function()
-        if os.clock()<api.retryAt or restoringConfig or api.bossPaused or (bossController and bossController.busy) or manualStarting or schedulerRunning or not alive or not (api.active or areaWatch.enabled or indexWatch.enabled)
+        if os.clock()<api.retryAt or restoringConfig or api.eventPaused or (eventController and eventController.busy) or manualStarting or schedulerRunning or not alive or not (api.active or areaWatch.enabled or indexWatch.enabled)
             or runner.active or training.leaving or api.committing then return end
         if not automationReady() then
             gui:SetAttribute("AutomationWaitingForLoad",true)
@@ -4568,7 +3707,7 @@ local function initializeRift()
         end)
     end
     function api.collectOnce(uid)
-        if api.bossPaused or (bossController and bossController.busy) then return end
+        if api.eventPaused or (eventController and eventController.busy) then return end
         if not alive or manualStarting or runner.active or api.active or api.committing or areaWatch.enabled or indexWatch.enabled then return end
         if not automationReady() then
             runStatus.Text="LOADING";runDetail.Text="Wait for your character and plot to load, then click COLLECT.";return
@@ -4592,32 +3731,32 @@ local function initializeRift()
         end)
     end
     -- Pause execution, not the user's desired toggles. Wait for old tasks to
-    -- relinquish movement before the boss controller can acquire it.
-    function api.pauseForBoss(cancelled)
-        api.bossPaused=true
-        if api.active then say("Boss priority","Paused for Auto Boss; this toggle stays enabled.") end
-        if indexWatch.enabled then indexMessage("PAUSED / Auto Boss has priority") end
-        if areaWatch.enabled then watchMessage("PAUSED  /  Auto Boss has priority") end
+    -- relinquish movement before the event controller can acquire it.
+    function api.pauseForEvent(cancelled)
+        api.eventPaused=true
+        if api.active then say("Event priority","Paused for DR Scramble; this toggle stays enabled.") end
+        if indexWatch.enabled then indexMessage("PAUSED / DR Scramble has priority") end
+        if areaWatch.enabled then watchMessage("PAUSED  /  DR Scramble has priority") end
         while api.committing do
-            if cancelled() then error("BOSS_CANCELLED",0) end
+            if cancelled() then error("EVENT_CANCELLED",0) end
             heartbeat:Wait()
         end
         generation+=1
-        if runner.active then runner.stop("Paused for Auto Boss") end
+        if runner.active then runner.stop("Paused for DR Scramble") end
         while schedulerRunning or manualStarting do
-            if cancelled() then error("BOSS_CANCELLED",0) end
+            if cancelled() then error("EVENT_CANCELLED",0) end
             heartbeat:Wait()
         end
-        if cancelled() then error("BOSS_CANCELLED",0) end
+        if cancelled() then error("EVENT_CANCELLED",0) end
         -- An assigned belt may have no workflow owner; claim it only to dismount.
         if training.belt then training.owner=generation end
         stopTraining()
         return treadmillZones,treadmillExitPoint(rootPart().Position,treadmillZones(true))
     end
-    function api.resumeAfterBoss()
-        api.bossPaused=false
+    function api.resumeAfterEvent()
+        api.eventPaused=false
         if not alive then return end
-        if api.active then say("Checking","Auto Boss returned; resuming the current recipe.") end
+        if api.active then say("Checking","DR Scramble finished; resuming the current recipe.") end
         if areaWatch.enabled then watchMessage("WAITING  /  checking your selected eggs") end
         task.defer(ensureWorkflow)
     end
@@ -4635,9 +3774,9 @@ local function initializeRift()
         end
     end
     function api.start()
-        if api.bossPaused or (bossController and bossController.busy) then
+        if api.eventPaused or (eventController and eventController.busy) then
             api.active=true;switchOn(true)
-            say("Boss priority","The Rift will resume after Auto Boss leaves the arena.")
+            say("Event priority","The Rift will resume after the drone round.")
             return
         end
         if manualStarting then say("Busy","A manual collection is starting. Finish it before enabling The Rift.");return end
@@ -4666,7 +3805,7 @@ local function initializeRift()
             api.stop("Stopped by keyboard","Keyboard")
         end
     end)
-    bossController=createBossController(bossPage)
+    eventController=createScrambleController(eventPage)
     switchOn(false);say("Ready","Continuous recipes: train on your treadmill while required eggs spawn or grow.")
     connect(Save.FieldSignal("Rift"),function()recipeDirty=true end)
     task.spawn(function()
@@ -4708,18 +3847,19 @@ do
             rules=areaWatch.rules,editingArea=areaWatch.editing,
             selectedArea=selected,search=search.Text,tab=gui:GetAttribute("ActiveTab"),
             position={x=panel.Position.X.Offset,y=panel.Position.Y.Offset},
-            autoArea=togglePreference.autoArea,rift=togglePreference.rift,autoBoss=togglePreference.autoBoss,bossHop=togglePreference.bossHop,autoIndex=togglePreference.autoIndex,indexAreas=indexWatch.areas,
+            autoArea=togglePreference.autoArea,rift=togglePreference.rift,autoEvent=togglePreference.autoEvent,autoIndex=togglePreference.autoIndex,indexAreas=indexWatch.areas,
             indexTargets=indexWatch.options.targets,indexStrategy=indexWatch.options.strategy,indexCompletion=indexWatch.options.completion,
             priorityOrder=table.clone(priorities.order),
             notifications=gui:GetAttribute("NotificationsEnabled")~=false,
             pendingRiftTrade=riftController and riftController.tradeRecovery or nil,
+            riftBanner=gui:GetAttribute("RiftWantedBanner"),
         }
     end)
     -- Restore both switches before the shared scheduler can start either feature.
     if togglePreference.autoArea and setWatchEnabled then setWatchEnabled(true) end
     if togglePreference.autoIndex and riftController then riftController.setIndexEnabled(true) end
     if togglePreference.rift and riftController then riftController.start() end
-    if togglePreference.autoBoss and bossController then bossController.setEnabled(true) end
+    if togglePreference.autoEvent and eventController then eventController.setEnabled(true) end
     restoringConfig=false
     connect(player.OnTeleport,function()configStore.request();configStore.flush()end)
     connect(Players.PlayerRemoving,function(leaving)
