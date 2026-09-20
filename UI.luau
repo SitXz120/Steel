@@ -1,6 +1,6 @@
 -- Egg Atlas UI. Loading this file returns factories without creating a window.
 -- All runtime data and actions are supplied explicitly by Main.luau.
-local UI={ApiVersion=1,Version="11.31.0"}
+local UI={ApiVersion=1,Version="11.31.1"}
 local C = {
     bg = Color3.fromRGB(17, 16, 25), side = Color3.fromRGB(26, 24, 38),
     card = Color3.fromRGB(39, 35, 53), edge = Color3.fromRGB(86, 76, 112),
@@ -512,16 +512,18 @@ function UI.CreateEventWidgets(page)
     local stateText=text(activity,"OFF",16,39,812,32,22,C.mint,true)
     local detail=text(activity,"Enable to wait for the next drone outbreak.",16,82,812,60,13,C.text)
     detail.TextWrapped=true;detail.TextTruncate=Enum.TextTruncate.None;detail.TextYAlignment=Enum.TextYAlignment.Top
-    local progress=section(page,"EventProgress",24,268,844,108,"YOUR EVENT PROGRESS")
+    local progress=section(page,"EventProgress",24,268,844,158,"YOUR EVENT PROGRESS")
     local samples=text(progress,"-- SAMPLES",16,36,280,28,20,C.mint,true)
     local parts=text(progress,"-- / 5 parts",324,40,200,24,14,C.text,true)
     local targets=text(progress,"-- personal drones",568,40,256,24,13,C.text)
-    local timeText=text(progress,"Reading the server schedule...",16,76,800,18,11,C.muted)
-    local flow=section(page,"EventFlow",24,392,844,184,"HOW IT WORKS")
-    local explanation=text(flow,"Wait for the server's event window while other features continue.\nDeliver a held egg first, then follow your own drones. The game handles bat attacks.\nCollect dropped rewards and return safely when the round ends.\nSamples stay in your wallet; spending and the Vault quest remain manual.",16,40,812,124,13,C.text)
+    local questText=text(progress,"Reading your five-part quest...",16,76,812,45,12,C.text)
+    questText.TextWrapped=true;questText.TextTruncate=Enum.TextTruncate.None;questText.TextYAlignment=Enum.TextYAlignment.Top
+    local timeText=text(progress,"Reading the server schedule...",16,130,800,18,11,C.muted)
+    local flow=section(page,"EventFlow",24,442,844,136,"HOW IT WORKS")
+    local explanation=text(flow,"Find both map parts, collect three drone parts, then repair the Vault for The Scrambler.\nThe same toggle handles the quest and drone outbreaks; completed rewards are skipped.\nOther enabled features resume while waiting. Samples are kept for you to spend.",16,40,812,83,13,C.text)
     explanation.TextWrapped=true;explanation.TextTruncate=Enum.TextTruncate.None;explanation.TextYAlignment=Enum.TextYAlignment.Top
     text(page,"Priority can be changed in Overview. WASD / Esc releases control. LEFT ALT hides the UI.",24,594,844,20,10,C.muted)
-    return {sw=sw,dot=dot,stateText=stateText,detail=detail,samples=samples,parts=parts,targets=targets,timeText=timeText}
+    return {sw=sw,dot=dot,stateText=stateText,detail=detail,samples=samples,parts=parts,targets=targets,timeText=timeText,questText=questText}
 end
 
 function UI.CreateRiftWidgets(page,banners)

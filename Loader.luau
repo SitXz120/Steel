@@ -1,6 +1,6 @@
 if game.PlaceId ~= 107778070777162 then return end
 
--- EGG ATLAS 11.31.0 | Public/private GitHub loader.
+-- EGG ATLAS 11.31.1 | Public/private GitHub loader.
 -- Run this loader locally. Upload Main.luau and UI.luau to the selected repository.
 -- Keep the token in the local TokenFile; never put it in a repository or a URL.
 local GITHUB={
@@ -11,7 +11,7 @@ local GITHUB={
     Folder="", -- Empty when Main.luau and UI.luau are at the repository root.
     TokenFile="EggAtlas-GitHub.token",
 }
-local VERSION="11.31.0"
+local VERSION="11.31.1"
 local token: string?=nil
 
 local function redact(value: any): string

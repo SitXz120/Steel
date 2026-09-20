@@ -5,7 +5,7 @@ if not game:IsLoaded() then
 end
 
 -- EGG ATLAS | Steal An Egg | 2026-09-14
-local SCRIPT_VERSION="11.31.0"
+local SCRIPT_VERSION="11.31.1"
 local UI=...
 assert(type(UI)=="table" and UI.ApiVersion==1 and UI.Version==SCRIPT_VERSION,
     "UI module missing or incompatible. Run Loader.luau or the standalone EggAtlas.luau.")
@@ -1930,11 +1930,26 @@ local function createScrambleModel(owner)
         end
         if api.snapshot and api.latestState then api.snapshot.State=api.latestState.State;api.snapshot.Ready=api.latestState.Ready end
     end
-    function api.active(now)
+    function api.available(now)
         local s=api.snapshot
         return s~=nil and s.Ready==true and s.Enabled==true and s.WorldReady==true
             and type(s.EventEndsAt)=="number" and now<s.EventEndsAt
-            and type(s.Window)=="table" and s.Window.Active==true
+    end
+    function api.quest(now,blocked): string?
+        if not api.available(now) then return nil end
+        local s=api.snapshot
+        local state=s.State
+        if type(state)~="table" or state.Completed then return nil end
+        if not state.Discovered then return not blocked.Discover and "Discover" or nil end
+        for _,id in ipairs({"LostPart1","LostPart2"}) do
+            if not (state.LostParts or {})[id] and not blocked[id] then return id end
+        end
+        if state.TotalParts==5 and s.VaultRewardReady==true and not blocked.Vault then return "Vault" end
+        return nil
+    end
+    function api.active(now)
+        local s=api.snapshot
+        return api.available(now) and type(s.Window)=="table" and s.Window.Active==true
             and type(s.Window.EndsAt)=="number" and now<s.Window.EndsAt
     end
     return api
@@ -2017,9 +2032,31 @@ local function createScrambleController(page)
         gui:SetAttribute("EventPhase",phase);gui:SetAttribute("EventMessage",message)
         if api.busy then gui:SetAttribute("WaitReason",phase=="Waiting" and message or nil) end
     end
+    local function caveTeleporter()
+        local objects=workspace:FindFirstChild("__OBJECTS")
+        local secret=objects and objects:FindFirstChild("SecretZones")
+        local cave=secret and secret:FindFirstChild("Cave")
+        return cave and cave:FindFirstChild("Teleporter")
+    end
+    local function insideCave()
+        local root=character()
+        local gates=caveTeleporter()
+        local arrival=gates and gates:FindFirstChild("EntryTp")
+        return root~=nil and arrival~=nil and arrival:IsA("BasePart")
+            and math.abs(root.Position.Y-arrival.Position.Y)<65 and (root.Position-arrival.Position).Magnitude<180
+    end
+    local function questJob(): string?
+        local blocked={}
+        for id,untilTime in pairs(delayed) do if untilTime>os.clock() then blocked[id]=true end end
+        return model.quest(workspace:GetServerTimeNow(),blocked)
+    end
     function api.hasOpportunity(): boolean
         return api.enabled and not disposed and not cancelled and not manualStarting and not player:GetAttribute("InBossArena")
-            and os.clock()>=nextAttempt and model.active(workspace:GetServerTimeNow()) and (target()~=nil or groundDrop()~=nil)
+            and (insideCave() or (os.clock()>=nextAttempt and (questJob()~=nil
+                or (model.active(workspace:GetServerTimeNow()) and (target()~=nil or groundDrop()~=nil)))))
+    end
+    function api.needsExit(): boolean
+        return api.enabled and not disposed and not cancelled and not manualStarting and insideCave()
     end
     local function check()
         if not alive or disposed or cancelled or not api.enabled then error("EVENT_CANCELLED",0) end
@@ -2038,6 +2075,146 @@ local function createScrambleController(page)
         end
         if not ok and not api.busy then say("Retrying","Event data unavailable; retrying while your toggle stays on.") end
     end
+    local function questPoint(id)
+        local s=model.snapshot
+        local info=s and s.Quest and s.Quest[id]
+        if info and typeof(info.Position)=="Vector3" then return info.Position end
+        local folder=workspace:FindFirstChild("DrScrambleEvent")
+        local object=folder and folder:FindFirstChild(id)
+        local interaction=object and object:FindFirstChild("InteractionPoint",true)
+        if interaction and interaction:IsA("Attachment") then return interaction.WorldPosition end
+        if object and object:IsA("Model") and object.PrimaryPart then return object.PrimaryPart.Position end
+        return nil
+    end
+    local function questDone(id): boolean
+        local state=model.snapshot and model.snapshot.State
+        if not state then return false end
+        if id=="Discover" then return state.Discovered==true end
+        if id=="Vault" then return state.Completed==true end
+        return state.Completed==true or (state.LostParts or {})[id]==true
+    end
+    local function crossCave(enter,zones)
+        if insideCave()==enter then return end
+        local gates=caveTeleporter()
+        local trigger=gates and gates:FindFirstChild(enter and "Entry" or "Exit")
+        local landing=gates and gates:FindFirstChild(enter and "EntryTp" or "ExitTp")
+        assert(trigger and trigger:IsA("BasePart") and landing and landing:IsA("BasePart"),"Waiting for the cave entrance to load")
+        local prompt=trigger:FindFirstChild("SecretZonePrompt",true)
+        assert(prompt and prompt:IsA("ProximityPrompt") and prompt.Enabled,"Cave interaction is unavailable")
+        local attachment=prompt.Parent
+        local point=attachment and attachment:IsA("Attachment") and attachment.WorldPosition or trigger.Position
+        local deadline=os.clock()+45
+        local function arrived(pos)
+            return math.abs(pos.Y-landing.Position.Y)<12
+                and (pos-landing.Position).Magnitude<22
+        end
+        local root=character()
+        assert(root,"Character is not ready")
+        local near=Vector3.new(point.X,root.Position.Y,point.Z)
+        runner.travel(near,enter and "Approaching the secret cave" or "Approaching the cave exit",function()
+            check()
+            if os.clock()>deadline then error("Cave approach timed out",0) end
+            local current=character()
+            if current and (current.Position-point).Magnitude<math.min(7,prompt.MaxActivationDistance-2) then return "At cave gate" end
+            return nil
+        end,zones)
+        -- The gate uses a ProximityPrompt, not touch. Movement is released before
+        -- the game's transport, so normal unexpected-teleport protection remains intact.
+        check()
+        root=character()
+        assert(root and (root.Position-point).Magnitude<=prompt.MaxActivationDistance,"Outside cave interaction range")
+        say("Quest",enter and "Entering the secret cave" or "Leaving the secret cave")
+        for attempt=1,5 do
+            check()
+            root=character()
+            assert(root,"Character is not ready")
+            if arrived(root.Position) then return end
+            assert(prompt.Enabled and (root.Position-point).Magnitude<=prompt.MaxActivationDistance,"Outside cave interaction range")
+            prompt:InputHoldBegin()
+            local ok,err=pcall(function()
+                local untilTime=os.clock()+prompt.HoldDuration+.15
+                while os.clock()<untilTime do
+                    check()
+                    local current=character()
+                    assert(current,"Character is not ready")
+                    if arrived(current.Position) then break end
+                    assert((current.Position-point).Magnitude<=prompt.MaxActivationDistance,"Moved away from the cave entrance")
+                    Run.Heartbeat:Wait()
+                end
+            end)
+            prompt:InputHoldEnd()
+            if not ok then error(err,0) end
+            -- A prompt immediately after arrival may still be on the game's cooldown.
+            deadline=os.clock()+3
+            repeat
+                check()
+                local current=character()
+                assert(current,"Character is not ready")
+                if arrived(current.Position) then return end
+                Run.Heartbeat:Wait()
+            until os.clock()>=deadline
+            if attempt==5 then error("Cave entrance did not transport the character",0) end
+        end
+    end
+    local function doQuest(id,zones)
+        if questDone(id) then return end
+        local underground=id=="Discover" or id=="Vault"
+        crossCave(underground,zones)
+        check()
+        local key=id=="Discover" and "EscapedExperiment" or id=="Vault" and "ExperimentVault" or id
+        local point=questPoint(key)
+        assert(point,"Quest location has not loaded: "..key)
+        local label=id=="Discover" and "Talking to Escaped Experiment" or id=="Vault" and "Repairing the Vault / claiming The Scrambler"
+            or "Collecting "..(id=="LostPart1" and "Mechanical Gear" or "Wiring Harness")
+        say("Quest",label)
+        local root=character()
+        assert(root,"Character is not ready")
+        local goal=Vector3.new(point.X,root.Position.Y,point.Z)
+        runner.travel(goal,label,function()
+            check()
+            if not model.available(workspace:GetServerTimeNow()) then error("Event is unavailable",0) end
+            if questDone(id) then return "Already collected" end
+            return nil
+        end,zones)
+        check()
+        if questDone(id) then return end
+        root=character()
+        point=questPoint(key)
+        assert(root and point,"Quest target disappeared")
+        if underground then
+            local s=model.snapshot
+            local radius=(s.Interactions or {})[id=="Discover" and "NpcRadius" or "VaultRadius"] or 12
+            assert((root.Position-point).Magnitude<=radius,"Outside quest interaction range")
+            if id=="Vault" then assert(s.State.Discovered and s.State.TotalParts==5 and s.VaultRewardReady,"Vault is not ready") end
+            local result=remotes.Request:InvokeServer(id)
+            check()
+            assert(type(result)=="table" and result.Ok==true,"Quest request was not accepted: "..tostring(type(result)=="table" and (result.Reason or result.Error) or result))
+            model.apply(result.Snapshot)
+        else
+            local folder=workspace:FindFirstChild("DrScrambleEvent")
+            local object=folder and folder:FindFirstChild(id)
+            local prompt=object and object:FindFirstChild("ClaimLostPart",true)
+            assert(prompt and prompt:IsA("ProximityPrompt") and prompt.Enabled,"Part is not ready to collect")
+            assert((root.Position-point).Magnitude<=prompt.MaxActivationDistance,"Outside part pickup range")
+            prompt:InputHoldBegin()
+            local ok,err=pcall(function()
+                local untilTime=os.clock()+prompt.HoldDuration+.15
+                while os.clock()<untilTime do
+                    check()
+                    local current=character()
+                    assert(current and (current.Position-point).Magnitude<=prompt.MaxActivationDistance,"Moved away from the part")
+                    Run.Heartbeat:Wait()
+                end
+            end)
+            prompt:InputHoldEnd()
+            if not ok then error(err,0) end
+        end
+        -- The server owns progress. Never mark a part or reward claimed locally.
+        fetch()
+        local deadline=os.clock()+4
+        while not questDone(id) and os.clock()<deadline do check();Run.Heartbeat:Wait() end
+        assert(questDone(id),"Waiting for the server to confirm "..id)
+    end
     local function run()
         local zones,exitPoint=riftController.pauseForEvent(function()return disposed or not alive or cancelled or not api.enabled end)
         check()
@@ -2050,9 +2227,19 @@ local function createScrambleController(page)
             while runner.carriedReturnPoint() and os.clock()<deadline do check();Run.Heartbeat:Wait() end
             assert(not runner.carriedReturnPoint(),"Waiting for the held egg to reach inventory")
         end
-        while model.active(workspace:GetServerTimeNow()) do
+        while true do
             check()
             if higherPriorityWork("Event") then break end
+            local job=questJob()
+            if job then
+                if exitPoint then runner.travel(exitPoint,"Leaving the treadmill for the quest",function()check();return nil end,zones,exitPoint);exitPoint=nil end
+                local ok,err=pcall(doQuest,job,zones)
+                check()
+                if not ok then delayed[job]=os.clock()+30;say("Retrying",tostring(err).." / quest will retry") end
+                continue
+            end
+            if insideCave() then crossCave(false,zones) end
+            if not model.active(workspace:GetServerTimeNow()) then break end
             local drop=groundDrop()
             local drone=target()
             if not drop and not drone then break end
@@ -2093,6 +2280,7 @@ local function createScrambleController(page)
             repeat check();Run.Heartbeat:Wait() until os.clock()>=untilTime
         end
         check()
+        if insideCave() then crossCave(false,zones) end
         local safePoint=runner.safeReturnPoint()
         if safePoint then
             say("Returning","Returning safely; your enabled features resume next.")
@@ -2140,7 +2328,15 @@ local function createScrambleController(page)
                     local samples=state.Samples or 0
                     startSamples=startSamples or samples
                     view.samples.Text=compact(samples).." SAMPLES"
-                    view.parts.Text=tostring(state.TotalParts or 0).." / 5 parts"
+                    view.parts.Text=state.Completed and "VAULT CLAIMED" or tostring(state.TotalParts or 0).." / 5 parts"
+                    local lost=state.LostParts or {}
+                    view.questText.Text=string.format("Mechanical Gear: %s   /   Wiring Harness: %s   /   Drone parts: %d / 3\n%s",
+                        lost.LostPart1 and "Collected" or "Missing",lost.LostPart2 and "Collected" or "Missing",state.DroneParts or 0,
+                        state.Completed and "The Scrambler claimed. Drone collection continues during outbreaks."
+                        or not state.Discovered and "Next: visit Escaped Experiment in the secret cave."
+                        or state.TotalParts==5 and "Next: return to the Vault and claim The Scrambler."
+                        or "Missing map parts are collected between rounds; drone parts come from outbreaks.")
+                    gui:SetAttribute("EventQuestParts",state.TotalParts or 0);gui:SetAttribute("EventQuestCompleted",state.Completed==true)
                     local count=0;for _,d in pairs(model.drones)do if d.Health>0 then count+=1 end end
                     view.targets.Text=tostring(count).." personal drones"
                     local active=model.active(workspace:GetServerTimeNow())
@@ -2157,7 +2353,7 @@ local function createScrambleController(page)
     task.spawn(function()
         while alive and not disposed do
             local ok,err=pcall(function()
-                if not restoringConfig and not api.busy and api.hasOpportunity() and not higherPriorityWork("Event") then
+                if not restoringConfig and not api.busy and os.clock()>=nextAttempt and api.hasOpportunity() and not higherPriorityWork("Event") then
                     api.busy=true;cancelled=false;gui:SetAttribute("EventBusy",true);gui:SetAttribute("AutomationOwner","Event")
                     local success,failure=pcall(run)
                     if runner.active then runner.stop("DR Scramble trip finished") end
@@ -2955,6 +3151,8 @@ local function initializeRift()
     end
     featureReady=function(name: string): boolean
         local ok,ready=pcall(function()
+            -- Finish leaving the underground room before scheduling any surface trip.
+            if eventController and eventController.needsExit() then return name=="Event" end
             if name=="Event" then return eventController~=nil and eventController.hasOpportunity() end
             if name=="Area" then return priorityEgg()~=nil end
             if name=="Index" then return indexJob()~=nil end
