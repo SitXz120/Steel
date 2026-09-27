@@ -5,7 +5,7 @@ if not game:IsLoaded() then
 end
 
 -- EGG ATLAS | Steal An Egg | 2026-09-14
-local SCRIPT_VERSION="11.31.1"
+local SCRIPT_VERSION="11.31.2"
 local UI=...
 assert(type(UI)=="table" and UI.ApiVersion==1 and UI.Version==SCRIPT_VERSION,
     "UI module missing or incompatible. Run Loader.luau or the standalone EggAtlas.luau.")
@@ -46,6 +46,20 @@ local Guards = require(RS.Data.Guards)
 local SpeedUtil = require(RS.Shared.Util.TreadmillUtil)
 local SpeedProjection = require(RS.Client.SpeedPowerProjection)
 local GameNumbers = require(RS.Shared.Utils.Numbers)
+-- World replaced __OBJECTS. Resolve only the gameplay hierarchy, not Build copies.
+local function worldObject(path: {string}, timeout: number?): Instance?
+    local deadline=os.clock()+(timeout or 0)
+    repeat
+        local node: Instance?=workspace:FindFirstChild("World") or workspace:FindFirstChild("__OBJECTS")
+        for _,name in ipairs(path) do
+            node=node and node:FindFirstChild(name)
+            if not node then break end
+        end
+        if node then return node end
+        if os.clock()>=deadline then return nil end
+        task.wait(.1)
+    until false
+end
 local TweenService = game:GetService("TweenService")
 local parent = player:WaitForChild("PlayerGui")
 local previousConfig
@@ -162,9 +176,7 @@ end
 
 -- Use the live game sign, whose recommendation is based on the guard's home position.
 local function updateAreaRequirements()
-    local objects=workspace:FindFirstChild("__OBJECTS")
-    local areas=objects and objects:FindFirstChild("Areas")
-    local folder=areas and areas:FindFirstChild("GuardAreas")
+    local folder=worldObject({"Areas","GuardAreas"})
     for _,a in ipairs(areaList) do
         local model=folder and folder:FindFirstChild(a.id)
         local sign=model and model:FindFirstChild("RequiredSpeedSign")
@@ -703,8 +715,8 @@ local function createRunner(onStatus)
         if not disposed then onStatus(phase,message,api.active) end
         print("EGG_RUN_PHASE",phase,message)
     end
-    local boundary=workspace:WaitForChild("__OBJECTS"):WaitForChild("Areas"):WaitForChild("SeparationLine")
-    assert(boundary:IsA("BasePart"),"Area separation line is unavailable")
+    local boundary=worldObject({"Areas","SeparationLine"},15)
+    assert(boundary and boundary:IsA("BasePart"),"Area separation line is unavailable; wait for the map to load and retry")
     local function line()return boundary end
     local function depth(pos) return Geo.SignedDistanceToLine(line(),pos) end
     local function findEgg(uid)
@@ -2033,10 +2045,7 @@ local function createScrambleController(page)
         if api.busy then gui:SetAttribute("WaitReason",phase=="Waiting" and message or nil) end
     end
     local function caveTeleporter()
-        local objects=workspace:FindFirstChild("__OBJECTS")
-        local secret=objects and objects:FindFirstChild("SecretZones")
-        local cave=secret and secret:FindFirstChild("Cave")
-        return cave and cave:FindFirstChild("Teleporter")
+        return worldObject({"SecretZones","Cave","Teleporter"})
     end
     local function insideCave()
         local root=character()
@@ -2760,7 +2769,8 @@ end
 
 -- Continuous Rift recipes, with a server/inventory barrier after each trade.
 local function initializeRift()
-    local Save=require(RS.Shared.Save)
+    local Profile=require(RS.Shared.Save)
+    local Save={Get=Profile.Await or Profile.Get,FieldSignal=Profile.Watch or Profile.FieldSignal}
     local Remotes=require(RS.Shared.Remotes)
     local Rift=require(RS.Data.Rift)
     local Recipes=require(RS.Shared.Modules.RiftRecipes)
@@ -2768,7 +2778,20 @@ local function initializeRift()
     local Items=require(RS.Shared.Util.AssetItems)
     local Plot=require(RS.Client.PlotState)
     local Renderer=require(RS.Shared.Eggs.PlacedEggRenderer)
-    local Sequence=require(player.PlayerScripts.GUI.RiftTradeIn.RiftSequence)
+    local Sequence
+    do
+        local controllers=RS:FindFirstChild("Controllers")
+        local controllerGui=controllers and controllers:FindFirstChild("GUI")
+        local controller=controllerGui and controllerGui:FindFirstChild("RiftTradeInController")
+        local sequenceModule=controller and controller:FindFirstChild("RiftSequence")
+        if not sequenceModule then
+            local legacyGui=player.PlayerScripts:FindFirstChild("GUI")
+            local legacyController=legacyGui and legacyGui:FindFirstChild("RiftTradeIn")
+            sequenceModule=legacyController and legacyController:FindFirstChild("RiftSequence")
+        end
+        assert(sequenceModule and sequenceModule:IsA("ModuleScript"),"Rift presentation module is unavailable")
+        Sequence=require(sequenceModule)
+    end
     -- Game presentation modules perform lazy requires in normal LocalScript context.
     local function gameCall(fn,...)
         local previous=getthreadidentity()
@@ -2932,18 +2955,21 @@ local function initializeRift()
     connect(Save.FieldSignal("Index"),function()indexRevision=-1;eggRevision+=1 end)
     indexChanged()
 
-    local Registry=require(RS.Client.Modules.RuntimeInstanceRegistry)
-    local Treadmills=require(RS.Data.Treadmills)
+    local function treadmillRender(slot): Model?
+        local folder=workspace:FindFirstChild("__ClientTreadmillRenders")
+        local model=folder and folder:FindFirstChild("TreadmillRender_"..tostring(slot))
+        return model and model:IsA("Model") and model or nil
+    end
     local training: {
         owner: number?,
         belt: string?,
         leaving: boolean,
         entering: boolean,
     } = {owner=nil,belt=nil,leaving=false,entering=false}
-    local initialSaveOK,initialSave=pcall(Save.Get)
-    local initialBelt=initialSaveOK and type(initialSave)=="table" and type(initialSave.TreadmillUpgradeLevel)=="number"
-        and Treadmills.GetByUpgradeLevel(initialSave.TreadmillUpgradeLevel)
-    if initialBelt and Registry.Peek("Treadmill",initialBelt._id) then training.belt=initialBelt._id end
+    for _,model in ipairs(game:GetService("CollectionService"):GetTagged("ActiveTreadmill")) do
+        local id=model:GetAttribute("ActiveTreadmillId")
+        if model.Parent and type(id)=="string" then training.belt=id;break end
+    end
     connect(Remotes.Treadmill.AssignedBeltShifted.OnClientEvent,function(id)
         training.belt=id
         if alive then
@@ -3232,7 +3258,7 @@ local function initializeRift()
         local plot=Plot.ResolvePlot()
         if not plot then return {} end
         local bottom=plot.PlotFolder:FindFirstChild("TreadmillBottom")
-        local model=Registry.Peek("TreadmillPlotRender",tostring(plot.Slot))
+        local model=treadmillRender(plot.Slot)
         if not bottom or not bottom:IsA("BasePart") or not model then
             treadmillCache.at=0
             return {}
@@ -3320,7 +3346,7 @@ local function initializeRift()
         end
         local plot=Plot.ResolvePlot()
         local bottom=plot and plot.PlotFolder:FindFirstChild("TreadmillBottom")
-        local model=plot and Registry.Peek("TreadmillPlotRender",tostring(plot.Slot))
+        local model=plot and treadmillRender(plot.Slot)
         if not bottom or not bottom:IsA("BasePart") or not model then
             say("Waiting","Treadmill unavailable; "..table.concat(waiting," / "))
             pause(token,1);return
@@ -3491,7 +3517,8 @@ local function initializeRift()
     end
     local function trade(token,s)
         checkRiftPriority(token)
-        local machine=workspace:WaitForChild("__OBJECTS"):WaitForChild("Machines"):WaitForChild("RiftMachine")
+        local machine=worldObject({"Machines","RiftMachine"},5)
+        assert(machine,"Rift machine is unavailable; waiting for the map to load")
         local prompt=machine:FindFirstChildWhichIsA("ProximityPrompt",true)
         assert(prompt and prompt.Parent:IsA("Attachment"),"Rift interaction point unavailable")
         local point=prompt.Parent.WorldPosition
@@ -3869,11 +3896,9 @@ local function initializeRift()
         local ok,ready=pcall(function()
             local save=Save.Get()
             local plot=Plot.ResolvePlot()
-            local objects=workspace:FindFirstChild("__OBJECTS")
-            local areas=objects and objects:FindFirstChild("Areas")
             return type(save)=="table" and type(save.Inventory)=="table" and type(save.Rift)=="table"
                 and plot~=nil and plot.PetArea~=nil and plot.CenterPoint~=nil and plot.PlotFolder~=nil
-                and areas~=nil and areas:FindFirstChild("SeparationLine")~=nil
+                and worldObject({"Areas","SeparationLine"})~=nil
         end)
         return ok and ready==true
     end
