@@ -5,7 +5,7 @@ if not game:IsLoaded() then
 end
 
 -- EGG ATLAS | Steal An Egg | 2026-09-14
-local SCRIPT_VERSION="11.31.2"
+local SCRIPT_VERSION="11.32.0"
 local UI=...
 assert(type(UI)=="table" and UI.ApiVersion==1 and UI.Version==SCRIPT_VERSION,
     "UI module missing or incompatible. Run Loader.luau or the standalone EggAtlas.luau.")
@@ -87,20 +87,19 @@ for _, child in ipairs(parent:GetChildren()) do
             local oldSearch=window and window:FindFirstChild("Search",true)
             previousConfig={rules=imported,editingArea=child:GetAttribute("AreaWatchEditingArea"),
                 selectedArea=child:GetAttribute("SelectedArea"),tab=child:GetAttribute("ActiveTab"),
-                autoArea=child:GetAttribute("AreaWatchEnabled")==true,rift=child:GetAttribute("RiftActive")==true,
+                autoArea=child:GetAttribute("AreaWatchEnabled")==true,
                 search=oldSearch and oldSearch:IsA("TextBox") and oldSearch.Text or "",
                 position=window and {x=window.Position.X.Offset,y=window.Position.Y.Offset} or nil}
             local indexOK,indexAreas=pcall(function()return game:GetService("HttpService"):JSONDecode(child:GetAttribute("IndexAreas") or "")end)
             if indexOK and type(indexAreas)=="table" then previousConfig.indexAreas=indexAreas end
             local targetsOK,indexTargets=pcall(function()return game:GetService("HttpService"):JSONDecode(child:GetAttribute("IndexTargets") or "")end)
             if targetsOK and type(indexTargets)=="table" then previousConfig.indexTargets=indexTargets end
-            previousConfig.riftBanner=child:GetAttribute("RiftWantedBanner")
             previousConfig.indexStrategy=child:GetAttribute("IndexStrategy")
             previousConfig.indexCompletion=child:GetAttribute("IndexCompletion")
             local priorityOK,priorityOrder=pcall(function()return game:GetService("HttpService"):JSONDecode(child:GetAttribute("PriorityOrder") or "")end)
             if priorityOK and type(priorityOrder)=="table" then previousConfig.priorityOrder=priorityOrder end
             previousConfig.notifications=child:GetAttribute("NotificationsEnabled")
-            for key,attribute in pairs({autoArea="AutoAreaWanted",rift="RiftWanted",autoEvent="EventWanted",autoIndex="IndexWanted"}) do
+            for key,attribute in pairs({autoArea="AutoAreaWanted",autoEvent="EventWanted",autoIndex="IndexWanted"}) do
                 local wanted=child:GetAttribute(attribute)
                 if type(wanted)=="boolean" then previousConfig[key]=wanted end
             end
@@ -198,7 +197,7 @@ local gui,panel=window.gui,window.panel
 gui:SetAttribute("AreaIconMode","Pet")
 gui:SetAttribute("PortalAvoidance",true)
 local connections, alive = {}, true
-local runner, selectedTarget, riftController, eventController
+local runner, selectedTarget, automationController, eventController
 local sessionOverview
 local function recordEvent(kind: string,message: string)
     if sessionOverview then sessionOverview.record(kind,(message:gsub("^.-:%d+: ",""))) end
@@ -313,7 +312,15 @@ local configStore=createConfigStore({
     end,
 })
 if configStore.status=="CONFIG NEW" and previousConfig then configStore.data=previousConfig end
-local togglePreference={autoArea=configStore.data.autoArea==true,rift=configStore.data.rift==true,autoEvent=configStore.data.autoEvent==true,}
+-- Retired event settings must never restart a removed feature after rejoining.
+local retiredConfig=configStore.data.rift~=nil or configStore.data.riftBanner~=nil
+    or configStore.data.pendingRiftTrade~=nil or configStore.data.tab=="Rift"
+    or (type(configStore.data.priorityOrder)=="table" and table.find(configStore.data.priorityOrder,"Rift")~=nil)
+configStore.data.rift=nil
+configStore.data.riftBanner=nil
+configStore.data.pendingRiftTrade=nil
+if configStore.data.tab=="Rift" then configStore.data.tab="Event" end
+local togglePreference={autoArea=configStore.data.autoArea==true,autoEvent=configStore.data.autoEvent==true,}
 for _,area in ipairs(areaList)do
     local saved=configStore.data.indexAreas
     indexWatch.areas[area.id]=type(saved)~="table" or saved[area.id]==true
@@ -328,17 +335,16 @@ gui:SetAttribute("IndexWanted",togglePreference.autoIndex)
 gui:SetAttribute("IndexEnabled",false)
 local restoringConfig=true
 gui:SetAttribute("AutoAreaWanted",togglePreference.autoArea)
-gui:SetAttribute("RiftWanted",togglePreference.rift)
 gui:SetAttribute("EventWanted",togglePreference.autoEvent)
 local function rememberToggle(key,on)
     togglePreference[key]=on==true
-    gui:SetAttribute(key=="autoIndex" and "IndexWanted" or key=="autoArea" and "AutoAreaWanted" or (key=="autoEvent" and "EventWanted" or "RiftWanted"),on==true)
+    gui:SetAttribute(key=="autoIndex" and "IndexWanted" or key=="autoArea" and "AutoAreaWanted" or "EventWanted",on==true)
     -- Explicit toggle choices must survive an immediate rejoin, without the UI debounce.
     configStore.request()
     configStore.flush()
 end
 local function createPriorityPolicy(saved)
-    local defaults={"Event","Area","Index","Rift"}
+    local defaults={"Event","Area","Index"}
     local order,seen={},{}
     if type(saved)=="table" then
         for _,savedName in ipairs(saved)do
@@ -387,7 +393,6 @@ local function refreshScheduler(callback,interval)
     end
 end
 local eggRevision=0
-local requestRiftRefresh
 local mountedWindow=UI.MountWindow({
     configStore=configStore,connect=connect,Input=Input,
     getViewport=function()
@@ -398,7 +403,7 @@ local mountedWindow=UI.MountWindow({
     alive = false
     areaWatch.enabled=false;indexWatch.enabled=false
     if eventController then eventController.destroy() end
-    if riftController then riftController.stop("Closed","UI closed") end
+    if automationController then automationController.stop("Closed","UI closed") end
     if runner then runner.destroy() end
     for _, c in ipairs(connections) do c:Disconnect() end
     table.clear(connections)
@@ -1677,7 +1682,7 @@ local function createRunner(onStatus)
             end
         end)
     end
-    -- Shared movement for the Rift plot and machine trips; one movement owner.
+    -- Shared movement for plot and event trips; one movement owner.
     function api.carriedReturnPoint()
         for _,egg in pairs(State.ReadFieldEggs().Records) do
             if egg.CarrierUserId==player.UserId then
@@ -1757,7 +1762,7 @@ local function createRunner(onStatus)
     table.insert(connections,player:GetAttributeChangedSignal("InBossArena"):Connect(function()
         if player:GetAttribute("InBossArena") then
             api.stop("Entered the boss arena. Auto movement stopped.")
-            if riftController then riftController.interruptForRecovery("Inside the boss arena") end
+            if automationController then automationController.interruptForRecovery("Inside the boss arena") end
         end
     end))
     return api
@@ -1768,7 +1773,7 @@ runner = createRunner(function(phase,message,active)
     runStatus.Text=string.upper(phase)
     runDetail.Text=message
     runStatus.TextColor3=(phase=="Stopped" or phase=="Unavailable") and Color3.fromRGB(244,132,154) or C.mint
-    stopTrip.Visible=manualStarting or (active and not areaWatch.enabled and not indexWatch.enabled and not (riftController and riftController.active))
+    stopTrip.Visible=manualStarting or (active and not areaWatch.enabled and not indexWatch.enabled)
     gui:SetAttribute("RunnerActive",active)
     gui:SetAttribute("RunnerPhase",phase)
     gui:SetAttribute("RunnerMessage",message)
@@ -1777,23 +1782,23 @@ gui:SetAttribute("RunnerActive",false)
 gui:SetAttribute("RunnerPhase","Idle")
 local function selectEgg(row)
     if (eventController and eventController.busy) or runner.active or manualStarting then runDetail.Text="A trip is already in progress. Wait or use STOP TRIP.";return end
-    if areaWatch.enabled or indexWatch.enabled or (riftController and (riftController.active or riftController.committing)) then
-        runDetail.Text="Pause Auto Area, Auto Index and The Rift before starting a manual collection.";return
+    if areaWatch.enabled or indexWatch.enabled then
+        runDetail.Text="Pause Auto Area and Auto Index before starting a manual collection.";return
     end
     selectedTarget={uid=row.uid}
     gui:SetAttribute("SelectedEggUid",row.uid)
     targetLabel.Text=row.pet.."  /  "..row.rarity.."  /  "..row.area.."  /  "..row.nest
     runStatus.Text="STARTING"
     runDetail.Text=row.carrierId and "Following the carrier until this egg drops; then returning safely." or "Starting your collection trip..."
-    if riftController then riftController.collectOnce(row.uid) else runner.start(row.uid) end
+    if automationController then automationController.collectOnce(row.uid) else runner.start(row.uid) end
     render(false)
 end
 connect(stopTrip.Activated,function()
     if eventController and eventController.busy then runDetail.Text="DR Scramble owns this trip. Use its toggle to leave, or WASD for manual control.";return end
-    if areaWatch.enabled or indexWatch.enabled or (riftController and riftController.active) then
+    if areaWatch.enabled or indexWatch.enabled then
         runDetail.Text="This trip belongs to automation. Use its feature toggle or WASD to stop.";return
     end
-    if riftController then riftController.stop("Manual trip stopped","Manual")
+    if automationController then automationController.stop("Manual trip stopped","Manual")
     elseif runner.active then runner.stop("Manual trip stopped. Held egg is kept.") end
 end)
 local function readSnapshot()
@@ -1840,7 +1845,7 @@ render = function(resetScroll)
     local character=player.Character
     local hum=character and character:FindFirstChildOfClass("Humanoid")
     UI.RenderAreas({gui=gui,areaView=areaView,snapshotGroups=snapshotGroups,selected=selected,selectedTarget=selectedTarget,
-        runner=runner,manualStarting=manualStarting,areaWatch=areaWatch,indexWatch=indexWatch,riftController=riftController,
+        runner=runner,manualStarting=manualStarting,areaWatch=areaWatch,indexWatch=indexWatch,
         snapshotRevision=snapshotRevision,areaList=areaList,areaById=areaById,compact=compact,selectEgg=selectEgg,
         yourPower=yourPower,walkSpeed=hum and hum.WalkSpeed or SpeedUtil.SpeedPowerToWalkSpeed(yourPower),
         isAlive=function()return alive end,isVisible=areasVisible},resetScroll)
@@ -1890,7 +1895,6 @@ connect(gui:GetAttributeChangedSignal("ActiveTab"),requestRefresh)
 local function eggChanged()
     eggRevision+=1
     requestRefresh()
-    if requestRiftRefresh then requestRiftRefresh() end
 end
 for _,signal in ipairs({State.FieldRefreshed,State.FieldShifted,State.FieldGone,
     State.SnapshotRefreshed,State.CarryChanged,State.FieldClaimed,State.ResetCountdown,State.ResetFade}) do
@@ -2225,7 +2229,7 @@ local function createScrambleController(page)
         assert(questDone(id),"Waiting for the server to confirm "..id)
     end
     local function run()
-        local zones,exitPoint=riftController.pauseForEvent(function()return disposed or not alive or cancelled or not api.enabled end)
+        local zones,exitPoint=automationController.pauseForEvent(function()return disposed or not alive or cancelled or not api.enabled end)
         check()
         local safe=runner.carriedReturnPoint()
         if safe then
@@ -2369,7 +2373,7 @@ local function createScrambleController(page)
                     api.busy=false
                     if not alive or disposed then return end
                     gui:SetAttribute("EventBusy",false);gui:SetAttribute("AutomationOwner",nil)
-                    riftController.resumeAfterEvent()
+                    automationController.resumeAfterEvent()
                     nextAttempt=os.clock()+(success and .5 or 3)
                     if not success and not cancelled then say("Retrying",tostring(failure).." / toggle stays on")
                     else say(api.enabled and "Waiting" or "Off",api.enabled and "Other features resumed; waiting for personal drones or the next round." or "DR Scramble automation is off.") end
@@ -2379,7 +2383,7 @@ local function createScrambleController(page)
                 if api.busy then
                     if runner.active then runner.stop("Recovering DR Scramble") end
                     api.busy=false;gui:SetAttribute("EventBusy",false)
-                    riftController.resumeAfterEvent()
+                    automationController.resumeAfterEvent()
                 end
                 say("Retrying",tostring(err));nextAttempt=os.clock()+3
             end
@@ -2722,8 +2726,8 @@ local function createHatchQueue(state: any,readSave: () -> any,activate: (string
             local elapsed=os.clock()-(receipt.returnedAt or receipt.at)
             if confirmed or (not eggs[uid] and elapsed>=45) or (eggs[uid] and elapsed>=(receipt.started and 15 or 3)) then
                 entries[uid]=nil;changed=true
-                if confirmed then print("RIFT_HATCH_CONFIRMED",receipt.category,confirmed)
-                else warn("RIFT_HATCH_RECHECK",uid,receipt.reason or "Inventory has not confirmed; rechecking current game state") end
+                if confirmed then print("EGG_HATCH_CONFIRMED",receipt.category,confirmed)
+                else warn("EGG_HATCH_RECHECK",uid,receipt.reason or "Inventory has not confirmed; rechecking current game state") end
             end
         end
         if changed then notify() end
@@ -2751,7 +2755,7 @@ local function createHatchQueue(state: any,readSave: () -> any,activate: (string
             receipt.returnedAt=os.clock()
             receipt.running=false
             receipt.reason=not ok and tostring(result) or (result~=true and tostring(reason) or nil)
-            if receipt.reason then warn("RIFT_HATCH_RESPONSE",entry.uid,receipt.reason) end
+            if receipt.reason then warn("EGG_HATCH_RESPONSE",entry.uid,receipt.reason) end
             notify()
         end)
         return true
@@ -2767,31 +2771,13 @@ local function createOverviewPage(page: Frame): OverviewAPI
     },page)
 end
 
--- Continuous Rift recipes, with a server/inventory barrier after each trade.
-local function initializeRift()
+-- Shared collection, hatching and training scheduler; DR Scramble can pause it.
+local function initializeAutomation()
     local Profile=require(RS.Shared.Save)
     local Save={Get=Profile.Await or Profile.Get,FieldSignal=Profile.Watch or Profile.FieldSignal}
     local Remotes=require(RS.Shared.Remotes)
-    local Rift=require(RS.Data.Rift)
-    local Recipes=require(RS.Shared.Modules.RiftRecipes)
-    local Kernel=require(RS.Shared.Util.FuseKernel)
-    local Items=require(RS.Shared.Util.AssetItems)
     local Plot=require(RS.Client.PlotState)
     local Renderer=require(RS.Shared.Eggs.PlacedEggRenderer)
-    local Sequence
-    do
-        local controllers=RS:FindFirstChild("Controllers")
-        local controllerGui=controllers and controllers:FindFirstChild("GUI")
-        local controller=controllerGui and controllerGui:FindFirstChild("RiftTradeInController")
-        local sequenceModule=controller and controller:FindFirstChild("RiftSequence")
-        if not sequenceModule then
-            local legacyGui=player.PlayerScripts:FindFirstChild("GUI")
-            local legacyController=legacyGui and legacyGui:FindFirstChild("RiftTradeIn")
-            sequenceModule=legacyController and legacyController:FindFirstChild("RiftSequence")
-        end
-        assert(sequenceModule and sequenceModule:IsA("ModuleScript"),"Rift presentation module is unavailable")
-        Sequence=require(sequenceModule)
-    end
     -- Game presentation modules perform lazy requires in normal LocalScript context.
     local function gameCall(fn,...)
         local previous=getthreadidentity()
@@ -2801,12 +2787,11 @@ local function initializeRift()
         if not result[1] then error(result[2],0) end
         return table.unpack(result,2,result.n)
     end
-    local purple=Color3.fromRGB(185,151,255)
     local featurePages=UI.CreatePages({
         gui=gui,panel=panel,header=header,close=close,watchPanel=watchPanel,
         featureNav=featureNav,connect=connect,savedTab=configStore.data.tab,
     })
-    local page,overviewPage,eventPage=featurePages.page,featurePages.overviewPage,featurePages.eventPage
+    local overviewPage,eventPage=featurePages.overviewPage,featurePages.eventPage
     local statsPage,indexPage=featurePages.statsPage,featurePages.indexPage
     sessionOverview=createOverviewPage(overviewPage)
     UI.CreatePriorityControls({order=priorities.order,connect=connect,shift=function(index,direction)
@@ -2817,57 +2802,12 @@ local function initializeRift()
         recordEvent("setting","Priority: "..table.concat(priorities.order," > "))
     end},overviewPage:FindFirstChild("OverviewPriority"))
     createEggStatsPage(statsPage)
-    local riftView=UI.CreateRiftWidgets(page,Rift.Banners)
-    local banner=riftView.banner
-    local timer=riftView.timer
-    local odds=riftView.odds
-    local rows=riftView.rows
-    local status=riftView.status
-    local detail=riftView.detail
-    local sw=riftView.sw
-    local dot=riftView.dot
-    local cycleLabel=riftView.cycleLabel
-    local api={
-        active=false,
-        phase="Ready",
-        rounds=0,
-        message="",
-        committing=false,
-        retryAt=0,
-        failures=0,
-        tradeRecovery=configStore.data.pendingRiftTrade,
-        eventPaused=false,
-        commitToken=nil :: number?,
-    }
-    riftController=api
-    local wantedBanner=type(configStore.data.riftBanner)=="string" and configStore.data.riftBanner or "Any"
-    if wantedBanner~="Any" and not Rift.GetBanner(wantedBanner) then wantedBanner="Any" end
-    local function acceptsBanner(s)
-        return s~=nil and (wantedBanner=="Any" or s.BannerId==wantedBanner)
-    end
-    local function paintBannerChoice()
-        gui:SetAttribute("RiftWantedBanner",wantedBanner)
-        for id,choice in pairs(riftView.bannerButtons) do
-            choice.BackgroundColor3=id==wantedBanner and C.selected or C.card
-            choice.TextColor3=id==wantedBanner and C.mint or C.muted
-            choice:SetAttribute("Selected",id==wantedBanner)
-        end
-    end
-    paintBannerChoice()
-    for id,choice in pairs(riftView.bannerButtons) do
-        connect(choice.Activated,function()
-            wantedBanner=id;eggRevision+=1;paintBannerChoice()
-            configStore.request();configStore.flush()
-        end)
-    end
+    local api={phase="Ready",message="",retryAt=0,failures=0,eventPaused=false}
+    automationController=api
     local generation=0
     local schedulerRunning=false
     local ensureWorkflow
     local heartbeat=game:GetService("RunService").Heartbeat
-    local liveState: any=nil
-    local lastFetch,fetching=0,false
-    local recipeDirty=true
-    local updateUI
     local hatchEnvironment=type(getgenv)=="function" and getgenv() or _G
     local hatchStore=hatchEnvironment.EggAtlasHatches
     if not hatchStore or hatchStore.job~=game.JobId or hatchStore.owner~=player.UserId then
@@ -2879,7 +2819,6 @@ local function initializeRift()
     end,player.UserId,hatchStore.entries,function()
         if not alive then return end
         eggRevision+=1
-        if requestRiftRefresh then requestRiftRefresh() end
     end)
     connect(Renderer.LocalEggHatchStarted,function(uid)
         local receipt=hatchStore.entries[uid]
@@ -2973,11 +2912,11 @@ local function initializeRift()
     connect(Remotes.Treadmill.AssignedBeltShifted.OnClientEvent,function(id)
         training.belt=id
         if alive then
-            gui:SetAttribute("RiftTraining",training.owner~=nil and id~=nil)
+            gui:SetAttribute("Training",training.owner~=nil and id~=nil)
         end
     end)
-    gui:SetAttribute("RiftTrainWhileWaiting",true)
-    gui:SetAttribute("RiftTraining",false)
+    gui:SetAttribute("TrainWhileWaiting",true)
+    gui:SetAttribute("Training",false)
     local function stopTraining(token)
         if training.owner==nil or (token and training.owner~=token) then return end
         if training.leaving then
@@ -3006,15 +2945,10 @@ local function initializeRift()
             end
             training.owner=nil
             training.entering=false
-            if alive then gui:SetAttribute("RiftTraining",false) end
+            if alive then gui:SetAttribute("Training",false) end
         end)
         training.leaving=false
         if not ok then error(err,0) end
-    end
-    local function switchOn(on)
-        sw:SetAttribute("On",on);gui:SetAttribute("RiftActive",on)
-        TweenService:Create(sw,TweenInfo.new(.18),{BackgroundColor3=on and Color3.fromRGB(52,199,89) or Color3.fromRGB(67,76,91)}):Play()
-        TweenService:Create(dot,TweenInfo.new(.18),{Position=UDim2.fromOffset(on and 31 or 3,3)}):Play()
     end
     local function say(phase,message)
         local changed=api.phase~=phase or api.message~=message
@@ -3023,36 +2957,30 @@ local function initializeRift()
         if alive then
             local waiting=phase=="Waiting" or phase=="Training" or phase=="Loading" or phase=="Retrying"
             if not (eventController and eventController.busy) then gui:SetAttribute("WaitReason",waiting and message or nil)end
-            status.Text=string.upper(phase);detail.Text=message
-            gui:SetAttribute("RiftPhase",phase);gui:SetAttribute("RiftMessage",message)
+            gui:SetAttribute("AutomationPhase",phase);gui:SetAttribute("AutomationMessage",message)
         end
-        if changed then print("RIFT_AUTO",phase,message) end
+        if changed then print("COLLECTION_AUTO",phase,message) end
     end
     local function recordStop(source,reason)
         if alive then
-            gui:SetAttribute("RiftLastStopSource",source)
-            gui:SetAttribute("RiftLastStopReason",reason)
-            gui:SetAttribute("RiftLastStopPhase",api.phase)
-            gui:SetAttribute("RiftLastStopAt",workspace:GetServerTimeNow())
+            gui:SetAttribute("AutomationLastStopSource",source)
+            gui:SetAttribute("AutomationLastStopReason",reason)
+            gui:SetAttribute("AutomationLastStopPhase",api.phase)
+            gui:SetAttribute("AutomationLastStopAt",workspace:GetServerTimeNow())
         end
-        print("RIFT_STOP",source,api.phase,reason)
+        print("COLLECTION_STOP",source,api.phase,reason)
     end
     function api.stop(reason,source)
         recordStop(source or "System",reason or "Stopped")
-        if (areaWatch.busy or indexWatch.busy) and source=="Toggle" then
-            api.active=false;switchOn(false)
-            say("Stopped","The Rift is off. The current collection trip is finishing.")
-            return
-        end
-        generation+=1;api.active=false
-        if runner.active and not (eventController and eventController.busy) then runner.stop(reason or "Rift stopped") end
+        generation+=1
+        if runner.active and not (eventController and eventController.busy) then runner.stop(reason or "Collection stopped") end
         local ok,err=pcall(stopTraining)
         if not ok then reason=tostring(err) end
-        if alive then switchOn(false);say("Stopped",reason or "Stopped. Your collected eggs and pets are kept.") end
+        if alive then say("Stopped",reason or "Stopped. Your collected eggs and pets are kept.") end
     end
     local function check(token: number): ()
-        if not alive or not (api.active or areaWatch.enabled or areaWatch.busy or indexWatch.enabled or indexWatch.busy or manualStarting) or token~=generation then error("CANCELLED",0) end
-        assert(not player:GetAttribute("InBossArena"),"Inside the boss arena; Auto Rift stopped")
+        if not alive or not (areaWatch.enabled or areaWatch.busy or indexWatch.enabled or indexWatch.busy or manualStarting) or token~=generation then error("CANCELLED",0) end
+        assert(not player:GetAttribute("InBossArena"),"Inside the boss arena; collection paused")
         local ch=player.Character;local h=ch and ch:FindFirstChildOfClass("Humanoid")
         assert(h and h.Health>0,"Character changed or died; waiting to resume")
     end
@@ -3069,111 +2997,19 @@ local function initializeRift()
         until eggRevision~=revision or os.clock()>=deadline
         check(token)
     end
-    local function riftShouldYield()
-        local owner=areaWatch.busy and "Area" or (indexWatch.busy and "Index" or "Rift")
-        return (owner=="Rift" and not acceptsBanner(liveState)) or higherPriorityWork(owner) or (owner~="Area" and priorities.before("Area",owner) and reserveAreaReset())
+    local function collectionShouldYield(): boolean
+        local owner=areaWatch.busy and "Area" or (indexWatch.busy and "Index" or nil)
+        if not owner then return false end
+        return higherPriorityWork(owner) or (owner~="Area" and priorities.before("Area",owner) and reserveAreaReset())
     end
-    local function checkRiftPriority(token: number): ()
+    local function checkCollectionPriority(token: number): ()
         check(token)
-        if riftShouldYield() then error(PRIORITY_INTERRUPTED,0) end
+        if collectionShouldYield() then error(PRIORITY_INTERRUPTED,0) end
     end
-    local function pauseRift(token: number,seconds: number): ()
+    local function pauseCollection(token: number,seconds: number): ()
         local deadline=os.clock()+seconds
-        repeat checkRiftPriority(token);heartbeat:Wait() until os.clock()>=deadline
-        checkRiftPriority(token)
-    end
-    local function fetch()
-        -- Serialize workflow and UI reads so an older response cannot overwrite a new recipe.
-        while fetching do task.wait(.05) end
-        fetching=true;recipeDirty=false
-        local ok,result=pcall(function()return Remotes.Rift.AskState:InvokeServer()end)
-        fetching=false
-        if not ok then recipeDirty=true;error(result,0) end
-        assert(type(result)=="table" and type(result.Requirements)=="table","Rift state unavailable")
-        liveState=result;lastFetch=os.clock()
-        if alive then
-            gui:SetAttribute("RiftRecipe",tostring(result.BannerId).."|"..table.concat(result.Requirements,"|"))
-            if updateUI then updateUI() end
-        end
-        return result
-    end
-    local function signature(s)
-        return tostring(s.BannerId).."|"..table.concat(s.Requirements,"|")
-    end
-    -- Pure inventory selection: distinct UIDs, game eligibility, lowest income first.
-    local function selectInputs(requirements: {string},save: any): ({[number]: {uid: string,item: any,rate: number}}, {number})
-        local equipped,used,chosen,counts={},{},{},{}
-        for _,uid in pairs(save.EquippedAssets or {}) do equipped[uid]=true end
-        for index,category in ipairs(requirements) do
-            local candidates={}
-            for uid,item in pairs(save.Inventory or {}) do
-                if item.Category==category and not equipped[uid] and not used[uid] then
-                    local ok,allowed=pcall(Kernel.MayEnterRift,uid,item)
-                    if ok and allowed then
-                        local rateOK,rate=pcall(Earnings.MutationOnlyRatePerSecond,item)
-                        table.insert(candidates,{uid=uid,item=item,rate=rateOK and rate or math.huge})
-                    end
-                end
-            end
-            table.sort(candidates,function(a,b)
-                if a.rate~=b.rate then return a.rate<b.rate end
-                if (a.item.Scale or 1)~=(b.item.Scale or 1) then return (a.item.Scale or 1)<(b.item.Scale or 1) end
-                return a.uid<b.uid
-            end)
-            counts[index]=#candidates
-            if candidates[1] then chosen[index]=candidates[1];used[candidates[1].uid]=true end
-        end
-        return chosen,counts
-    end
-    local function ownedFor(category: string): {{uid: string,egg: any}}
-        local eggs={}
-        for uid,egg in pairs(State.ReadOwnerEggs(player.UserId)) do
-            if egg.AssetCategory==category and not hatchQueue.contains(uid) then table.insert(eggs,{uid=uid,egg=egg}) end
-        end
-        table.sort(eggs,function(a,b)
-            local ar,br=State.IsReadyToHatch(a.uid),State.IsReadyToHatch(b.uid)
-            if ar~=br then return ar end
-            if (a.egg.Placement~=nil)~=(b.egg.Placement~=nil) then return a.egg.Placement~=nil end
-            if a.egg.AssetScale~=b.egg.AssetScale then return a.egg.AssetScale<b.egg.AssetScale end
-            return a.uid<b.uid
-        end)
-        return eggs
-    end
-    local function fieldsFor(category: string): {any}
-        if FieldCycle.read().blocked then return {} end
-        local eggs={};local root=player.Character and player.Character:FindFirstChild("HumanoidRootPart")
-        for _,egg in pairs(State.ReadFieldEggs().Records) do
-            if egg.AssetCategory==category and isCollectible(egg) and fieldRetryReady(egg) then table.insert(eggs,egg) end
-        end
-        table.sort(eggs,function(a,b)
-            local aa,bb=areaById[a.AreaId],areaById[b.AreaId]
-            if (aa and aa.rank or 99)~=(bb and bb.rank or 99) then return (aa and aa.rank or 99)<(bb and bb.rank or 99) end
-            if root then return (a.BottomCFrame.Position-root.Position).Magnitude<(b.BottomCFrame.Position-root.Position).Magnitude end
-            return a.Uid<b.Uid
-        end)
-        return eggs
-    end
-    local riftReadyAt,riftReadyRevision,riftReadyValue=0,-1,false
-    local function riftWorkReady(): boolean
-        if not api.active then return false end
-        if api.committing or api.tradeRecovery then return true end
-        local s=liveState
-        if not s or not s.Unlocked or #s.Requirements~=3 then return false end
-        if s.PendingReward then return true end
-        if not acceptsBanner(s) then return false end
-        if riftReadyRevision==eggRevision and os.clock()<riftReadyAt then return riftReadyValue end
-        riftReadyAt=os.clock()+.15;riftReadyRevision=eggRevision;riftReadyValue=false
-        local inputs=selectInputs(s.Requirements,Save.Get())
-        if inputs[1] and inputs[2] and inputs[3] then riftReadyValue=true;return true end
-        for i,category in ipairs(s.Requirements)do
-            if not inputs[i] and not hatchQueue.pending(category) then
-                local eggs=ownedFor(category)
-                if eggs[1] then
-                    if not eggs[1].egg.Placement or State.IsReadyToHatch(eggs[1].uid) then riftReadyValue=true;return true end
-                elseif fieldsFor(category)[1] then riftReadyValue=true;return true end
-            end
-        end
-        return false
+        repeat checkCollectionPriority(token);heartbeat:Wait() until os.clock()>=deadline
+        checkCollectionPriority(token)
     end
     featureReady=function(name: string): boolean
         local ok,ready=pcall(function()
@@ -3182,7 +3018,6 @@ local function initializeRift()
             if name=="Event" then return eventController~=nil and eventController.hasOpportunity() end
             if name=="Area" then return priorityEgg()~=nil end
             if name=="Index" then return indexJob()~=nil end
-            if name=="Rift" then return riftWorkReady() end
             return false
         end)
         return ok and ready==true
@@ -3195,60 +3030,11 @@ local function initializeRift()
         elseif name=="Index" then
             local job=indexJob();action=job and ("Auto Index / "..job.kind.." / "..job.category) or "Auto Index"
         elseif name=="Event" then action="DR Scramble / collect Samples from personal drones"
-        elseif name=="Rift" then action="The Rift / continue the current recipe" end
+        end
         gui:SetAttribute("NextAction",action)
         return name
     end
-    local function reserveForRift(): boolean
-        return api.active and priorities.before("Area","Rift") and reserveAreaReset()
-    end
-    connect(Save.FieldSignal("Inventory"),function()riftReadyAt=0;eggRevision+=1 end)
-    updateUI=function()
-        if not alive then return end
-        local cycle=FieldCycle.read()
-        gui:SetAttribute("RiftFieldCycle",cycle.blocked and "Night / resetting" or "Day")
-        gui:SetAttribute("RiftResetRemaining",math.ceil(cycle.remaining))
-        cycleLabel.Text="CONTINUOUS  /  "..api.rounds.." event eggs confirmed  /  "..(cycle.blocked and "NIGHT / FIELD RESET - training wait" or "DAY - field open")
-        gui:SetAttribute("RiftCompletedCycles",api.rounds)
-        if not page.Visible or not panel.Visible then return end
-        local s=liveState;if not s then return end
-        local inputs,counts=selectInputs(s.Requirements,Save.Get())
-        banner.Text=(s.BannerDisplayName or s.BannerId).."  /  "..(s.PityCount or 0).." / "..(s.PityThreshold or 50).." pity"
-        local remaining=math.max(0,math.floor((s.SecondsUntilRotation or 0)-(os.clock()-lastFetch)))
-        timer.Text=string.format("ROTATES IN  %02d:%02d:%02d",remaining//3600,(remaining%3600)//60,remaining%60)
-        local chances,total={},0
-        for _,v in ipairs(s.PetOdds or {}) do total+=v.Weight end
-        for _,v in ipairs(s.PetOdds or {}) do table.insert(chances,v.AssetId.." "..compact(total>0 and v.Weight/total*100 or 0).."%") end
-        odds.Text=table.concat(chances,"  /  ")
-        local ready=0
-        for i,row in ipairs(rows) do
-            local id=s.Requirements[i];local cfg=id and Assets.Directory[id]
-            local eggs=id and ownedFor(id) or {};local field=id and fieldsFor(id) or {}
-            local _,area=Recipes.SpawnChanceOf(id or "")
-            row.name.Text=cfg and cfg.DisplayName or id or "--";row.icon.Image=cfg and cfg.Icon or ""
-            local rarity,rarityColor=petRarity(id)
-            row.rarity.Text="Rarity: "..rarity
-            row.rarity.TextColor3=rarityColor
-            row.card:SetAttribute("PetRarity",rarity)
-            row.detail.Text=(area or "Unknown area").."  /  "..#eggs.." owned eggs  /  "..#field.." field eggs"
-            local requirementStatus: string="NEEDS COLLECTING"
-            if inputs[i] then requirementStatus="READY  x"..counts[i]
-            elseif id and hatchQueue.pending(id) then requirementStatus="HATCHING"
-            elseif #eggs>0 then requirementStatus="NEEDS HATCHING" end
-            row.status.Text=requirementStatus
-            row.status.TextColor3=inputs[i] and C.mint or purple
-            row.card:SetAttribute("Pet",id);row.card:SetAttribute("ReadyCount",counts[i] or 0)
-            row.card:SetAttribute("FieldCount",#field);row.card:SetAttribute("OwnedEggCount",#eggs)
-            if inputs[i] then ready+=1 end
-        end
-        gui:SetAttribute("RiftReadyCount",ready);gui:SetAttribute("RiftBanner",s.BannerId)
-    end
-    requestRiftRefresh=refreshScheduler(function()
-        local ok,err=pcall(updateUI)
-        if not ok then warn("RIFT_UI",err) end
-    end,.1)
-    connect(page:GetPropertyChangedSignal("Visible"),requestRiftRefresh)
-    connect(panel:GetPropertyChangedSignal("Visible"),requestRiftRefresh)
+    connect(Save.FieldSignal("Inventory"),function()eggRevision+=1 end)
     local function rootPart()
         return assert(player.Character and player.Character:FindFirstChild("HumanoidRootPart"),"Character unavailable")
     end
@@ -3294,15 +3080,15 @@ local function initializeRift()
         return treadmillExitPoint(rootPart().Position,treadmillZones(true))
     end
     local function walk(token: number,destination: Vector3,label: string): ()
-        -- Plot/hatch/trade trips avoid re-entering the treadmill after dismounting.
+        -- Plot/hatch trips avoid re-entering the treadmill after dismounting.
         for _=1,3 do
-            checkRiftPriority(token)
+            checkCollectionPriority(token)
             local exitPoint=prepareDeparture(token)
-            checkRiftPriority(token)
+            checkCollectionPriority(token)
             local function interrupt()
                 check(token)
                 if training.belt then training.owner=token;return "treadmill entered" end
-                if riftShouldYield() then return "area priority" end
+                if collectionShouldYield() then return "area priority" end
                 return nil
             end
             say("Travelling",label)
@@ -3314,35 +3100,18 @@ local function initializeRift()
         end
         error("Treadmill repeatedly recaptured the character; stopped after 3 recovery attempts",0)
     end
-    -- Check local egg/inventory changes while training; refresh the server recipe separately.
-    local function waitingWorkReady(s)
+    -- React to field and inventory changes while using the game's treadmill.
+    local function waitingWorkReady(): boolean
         hatchQueue.refresh()
         if api.finishIndexIfComplete() then return true end
         if priorityEgg() or indexJob() then return true end
-        if eventController and eventController.hasOpportunity() then return true end
-        if not api.active or not s or not acceptsBanner(s) then return false end
-        local inputs=selectInputs(s.Requirements,Save.Get())
-        if inputs[1] and inputs[2] and inputs[3] then return true end
-        for i,category in ipairs(s.Requirements) do
-            if not inputs[i] and not hatchQueue.pending(category) then
-                local eggs=ownedFor(category)
-                if eggs[1] then
-                    if not eggs[1].egg.Placement or State.IsReadyToHatch(eggs[1].uid) then return true end
-                elseif fieldsFor(category)[1] then return true end
-            end
-        end
-        return false
+        return eventController~=nil and eventController.hasOpportunity()
     end
-    local function trainWhileWaiting(token,s,waiting)
+    local function trainWhileWaiting(token,waiting)
         check(token)
-        if waitingWorkReady(s) then return end
-        local riftWasActive=api.active
-        local startingBanner=wantedBanner
-        local reservedReset=reserveForRift()
-        local function workChanged()
-            return api.active~=riftWasActive or wantedBanner~=startingBanner or waitingWorkReady(s)
-                or reserveForRift()~=reservedReset
-                or (s and liveState and signature(liveState)~=signature(s))
+        if waitingWorkReady() then return end
+        local function workChanged(): boolean
+            return waitingWorkReady()
         end
         local plot=Plot.ResolvePlot()
         local bottom=plot and plot.PlotFolder:FindFirstChild("TreadmillBottom")
@@ -3360,11 +3129,9 @@ local function initializeRift()
             local function interrupt()
                 check(token)
                 if training.belt then return "training" end
-                if api.active~=riftWasActive or wantedBanner~=startingBanner or reserveForRift()~=reservedReset
-                    or (s and liveState and signature(liveState)~=signature(s)) then return "work ready" end
                 if seenRevision~=eggRevision or os.clock()>=pollAt then
                     seenRevision=eggRevision
-                    pollAt=os.clock()+.25;ready=waitingWorkReady(s)
+                    pollAt=os.clock()+.25;ready=waitingWorkReady()
                 end
                 if ready then return "work ready" end
                 return nil
@@ -3390,7 +3157,7 @@ local function initializeRift()
         end
         check(token)
         training.entering=false
-        gui:SetAttribute("RiftTraining",true)
+        gui:SetAttribute("Training",true)
         local function trainingStatus()
             local cycle=FieldCycle.read()
             say("Training",(cycle.blocked and "Night/reset: training until the field reopens. " or "Running on your treadmill while ")..table.concat(waiting," / "))
@@ -3404,25 +3171,19 @@ local function initializeRift()
             end
         end
         trainingStatus()
-        local nextRefresh=os.clock()+10
         while true do
             check(token)
             trainingStatus()
-            assert(player.Character==trainingCharacter,"Character changed during training; Auto Rift stopped")
+            assert(player.Character==trainingCharacter,"Character changed during training; collection paused")
             if not training.belt then
                 training.entering=false
-                gui:SetAttribute("RiftTraining",false)
+                gui:SetAttribute("Training",false)
                 say("Waiting","Treadmill ended; checking available work before returning to training.")
                 waitForEggChange(token,.25);return
             end
             if workChanged() then break end
-            if s and api.active and os.clock()>=nextRefresh then
-                local fresh=fetch();check(token);nextRefresh=os.clock()+10
-                if signature(fresh)~=signature(s) or not fresh.Unlocked or fresh.PendingReward then break end
-            end
             waitForEggChange(token,.25)
         end
-        if reserveForRift() and not priorityEgg() then return end
         stopTraining(token);check(token)
     end
     local function placementPlan(preferred: {slot: any,position: Vector3}?): ({slot: any,position: Vector3},any)
@@ -3460,7 +3221,7 @@ local function initializeRift()
     end
     local function plant(token: number,uid: string,preferred: {slot: any,position: Vector3}?): ()
         for _=1,3 do
-            checkRiftPriority(token)
+            checkCollectionPriority(token)
             local egg=State.ReadOwnerEggs(player.UserId)[uid]
             assert(egg,"The collected egg is not in your inventory")
             if egg.Placement then return end
@@ -3469,7 +3230,7 @@ local function initializeRift()
             if ((rootPart().Position-goal)*Vector3.new(1,0,1)).Magnitude>3 then
                 walk(token,goal,"Moving directly to the hatching space")
             end
-            checkRiftPriority(token)
+            checkCollectionPriority(token)
             -- The player may have placed another egg while we were returning.
             local current,currentPlot=placementPlan(placement)
             if current.slot~=placement.slot or (current.position-placement.position).Magnitude>1 then
@@ -3480,162 +3241,33 @@ local function initializeRift()
             assert(egg,"The collected egg is no longer in your inventory")
             if egg.Placement then return end
             say("Planting","Placing the collected egg in its hatching space")
-            checkRiftPriority(token)
+            checkCollectionPriority(token)
             local ok,reason=State.WearEggTool(uid);assert(ok,reason or "Cannot equip required egg")
             check(token)
-            if riftShouldYield() then
-                ok,reason=State.DoffEggTool(uid);assert(ok,reason or "Cannot put the Rift egg back in inventory")
+            if collectionShouldYield() then
+                ok,reason=State.DoffEggTool(uid);assert(ok,reason or "Cannot put the egg back in inventory")
                 check(token)
                 error(PRIORITY_INTERRUPTED,0)
             end
             ok,reason=State.PlantEgg(uid,currentPlot.CenterPoint.CFrame:ToObjectSpace(CFrame.new(current.position)))
             assert(ok,reason or "Egg placement refused")
-            gameCall(Renderer.Refresh);pauseRift(token,1)
+            gameCall(Renderer.Refresh);pauseCollection(token,1)
             return
         end
         error("Hatching space kept changing; stopped before placing the egg",0)
     end
     local function hatch(token,entry)
-        checkRiftPriority(token)
+        checkCollectionPriority(token)
         if hatchQueue.contains(entry.uid) then return false end
         if not State.IsReadyToHatch(entry.uid) then return false end
         local plot=assert(Plot.ResolvePlot(),"Your plot is not loaded")
         local p=(plot.CenterPoint.CFrame*entry.egg.Placement.LocalCFrame).Position
         walk(token,p+Vector3.new(5,3,0),"Returning to hatch "..entry.egg.AssetCategory)
-        checkRiftPriority(token)
+        checkCollectionPriority(token)
         if not State.IsReadyToHatch(entry.uid) then return false end
         say("Hatching","Starting "..entry.egg.AssetCategory.."; continuing other work while it hatches")
-        checkRiftPriority(token)
+        checkCollectionPriority(token)
         return hatchQueue.start(entry)
-    end
-    local function tradeSettled(receipt,fresh,save)
-        if not receipt.claimConfirmed or fresh.PendingReward then return false end
-        local count=(save.Rift.TradeInsByBanner or {})[receipt.banner] or 0
-        if count<=receipt.beforeCount then return false end
-        for _,uid in ipairs(receipt.ids) do if save.Inventory[uid] then return false end end
-        return true
-    end
-    local function trade(token,s)
-        checkRiftPriority(token)
-        local machine=worldObject({"Machines","RiftMachine"},5)
-        assert(machine,"Rift machine is unavailable; waiting for the map to load")
-        local prompt=machine:FindFirstChildWhichIsA("ProximityPrompt",true)
-        assert(prompt and prompt.Parent:IsA("Attachment"),"Rift interaction point unavailable")
-        local point=prompt.Parent.WorldPosition
-        local root=rootPart();local delta=(root.Position-point)*Vector3.new(1,0,1)
-        local goal=point+(delta.Magnitude>.01 and delta.Unit or Vector3.xAxis)*5
-        walk(token,Vector3.new(goal.X,root.Position.Y,goal.Z),"Bringing the three pets to The Rift")
-        check(token)
-        local fresh=fetch();check(token)
-        if signature(fresh)~=signature(s) or not acceptsBanner(fresh) then return false end
-        if wantedBanner~="Any" and (fresh.SecondsUntilRotation or 0)<=2 then pauseRift(token,.5);return false end
-        assert(fresh.Unlocked==true,"The Rift is locked")
-        assert(not fresh.PendingReward,"Claim the existing Rift reward before starting a new trade")
-        local selected=selectInputs(fresh.Requirements,Save.Get())
-        local ids,decoded={},{}
-        for i=1,3 do
-            if not selected[i] then return false end
-            ids[i]=selected[i].uid;decoded[i]=Items.Decode(selected[i].item)
-        end
-        assert((rootPart().Position-point).Magnitude<=math.max(prompt.MaxActivationDistance,10),"Not close enough to The Rift")
-        local before=State.ReadOwnerEggs(player.UserId)
-        local beforeCount=(Save.Get().Rift.TradeInsByBanner or {})[fresh.BannerId] or 0
-        check(token)
-        checkRiftPriority(token)
-        say("Trading","Offering three pets for one "..(fresh.BannerDisplayName or fresh.BannerId).." egg")
-        -- Send exactly once. An uncertain response stops; it must never repeat a sacrifice.
-        api.tradeRecovery={banner=fresh.BannerId,beforeCount=beforeCount,ids=ids}
-        configStore.request();configStore.flush()
-        api.committing=true
-        api.commitToken=token
-        gui:SetAttribute("RiftCommitting",true)
-        local called,accepted,reason=pcall(function()return Remotes.Rift.AskTradeIn:InvokeServer(ids)end)
-        if called and accepted~=true then api.tradeRecovery=nil;configStore.request();configStore.flush() end
-        assert(called,"Trade response uncertain. Check The Rift before starting again.")
-        assert(accepted==true,reason or "The Rift refused this trade")
-        local receipt={banner=fresh.BannerId,beforeCount=beforeCount,ids=ids,recipe=signature(fresh),claimConfirmed=false}
-        -- The recipe changes at acceptance; publish it without waiting for the reveal.
-        local stateOK,acceptedState=pcall(fetch)
-        if stateOK and type(acceptedState.PendingReward)=="table" then receipt.rewardUid=acceptedState.PendingReward.Uid end
-        local pending=Save.Get().Rift.PendingReward
-        if not receipt.rewardUid and type(pending)=="table" then receipt.rewardUid=pending.Uid end
-        local finished=false
-        local function finishClaim()
-            if finished then return end
-            finished=true
-            local ok,result=pcall(function()return Remotes.Rift.AskFinishReveal:InvokeServer()end)
-            receipt.claimConfirmed=ok and result~=false
-            recipeDirty=true
-            print("RIFT_CLAIM_RESPONSE",ok,tostring(result),receipt.rewardUid)
-            if not ok then warn("RIFT_CLAIM_PENDING",result) end
-        end
-        -- Complete a committed trade even if the user stops during the animation.
-        local shown=pcall(gameCall,Sequence.Play,decoded,finishClaim)
-        if not shown then finishClaim() end
-        local untilTime=os.clock()+50
-        local nextRead=0
-        repeat
-            local owned=State.ReadOwnerEggs(player.UserId)
-            for uid,egg in pairs(owned) do
-                if (receipt.rewardUid and uid==receipt.rewardUid)
-                    or (not before[uid] and Rift.BannerContainsPet(fresh.BannerId,egg.AssetCategory)) then
-                    if not finished then finishClaim() end
-                    receipt.rewardUid=uid
-                    receipt.claimConfirmed=true
-                end
-            end
-            if os.clock()>=nextRead then
-                local ok,current=pcall(fetch);nextRead=os.clock()+1
-                if ok and tradeSettled(receipt,current,Save.Get()) then
-                    -- A reward may already be hatched/moved by the player. The server's
-                    -- cleared pending claim + consumed UIDs + incremented counter still confirm it.
-                    print("RIFT_REWARD_CONFIRMED",receipt.rewardUid or "server claim",signature(current))
-                    while Sequence.IsPlaying() do task.wait(.1) end
-                    return receipt
-                end
-            end
-            task.wait(.3)
-        until os.clock()>untilTime
-        if not finished then finishClaim() end
-        error("Trade accepted; reward has not appeared yet. Check The Rift pending reward before restarting.",0)
-    end
-    local function chooseFieldEgg(field)
-        local cycle=FieldCycle.read()
-        if cycle.blocked then return nil,nil end
-        for _,egg in ipairs(field) do
-            local current=State.ReadFieldEgg(egg.Uid)
-            local latestCycle=FieldCycle.read()
-            if latestCycle.blocked or latestCycle.epoch~=cycle.epoch then return nil,nil end
-            if current and isCollectible(current) then return current,cycle.epoch end
-        end
-        return nil,nil
-    end
-    local function nextRecipe(token,receipt)
-        check(token)
-        say("Refreshing","Event egg received. Waiting for the next recipe and updated inventory.")
-        local deadline=os.clock()+20
-        repeat
-            check(token)
-            local fresh=fetch();check(token)
-            local save=Save.Get()
-            local count=(save.Rift.TradeInsByBanner or {})[receipt.banner] or 0
-            local consumed=true
-            for _,uid in ipairs(receipt.ids) do if save.Inventory[uid] then consumed=false;break end end
-            -- A randomly repeated recipe is valid. Never require different pet names.
-            if count>receipt.beforeCount and consumed and not fresh.PendingReward
-                and #fresh.Requirements==3 and signature(fresh)==save.Rift.RequirementsBannerId.."|"..table.concat(save.Rift.Requirements,"|") then
-                api.tradeRecovery=nil;api.failures=0
-                configStore.request();configStore.flush()
-                api.committing=false
-                api.commitToken=nil
-                gui:SetAttribute("RiftCommitting",false)
-                gui:SetAttribute("RiftLastRewardUid",receipt.rewardUid)
-                print("RIFT_NEXT_RECIPE",receipt.recipe,"->",signature(fresh),"trade count",count)
-                return fresh
-            end
-            pause(token,.5)
-        until os.clock()>deadline
-        error("Event egg received, but the new recipe or inventory has not synced. Stopped before another trade.",0)
     end
     local function runPriorityTrip(token)
         local target=priorityEgg()
@@ -3644,7 +3276,6 @@ local function initializeRift()
         gui:SetAttribute("AreaWatchBusy",true);gui:SetAttribute("AutomationOwner","Area")
         local ok,err=pcall(function()
             check(token)
-            if api.active then say("Area priority","Finishing the selected Area egg first; The Rift will resume automatically.") end
             local exitPoint=prepareDeparture(token)
             check(token)
             -- Re-read after the server confirms dismount; the field or filter may have changed.
@@ -3687,9 +3318,9 @@ local function initializeRift()
         indexWatch.busy=true;gui:SetAttribute("IndexBusy",true);gui:SetAttribute("AutomationOwner","Index")
         local target=nil
         local ok,err=pcall(function()
-            checkRiftPriority(token)
+            checkCollectionPriority(token)
             local exitPoint=prepareDeparture(token)
-            checkRiftPriority(token)
+            checkCollectionPriority(token)
             job=indexScan(true).job
             if not job or not indexWatch.enabled then return end
             if job.kind=="plant" then
@@ -3703,7 +3334,7 @@ local function initializeRift()
                 indexMessage("COLLECTING / "..target.AreaId.." / "..job.category)
                 runner.start(target.Uid,FieldCycle.read().epoch,{
                     avoidZones=treadmillZones,exitPoint=exitPoint,
-                    priorityCheck=riftShouldYield,
+                    priorityCheck=collectionShouldYield,
                 })
                 while runner.active do check(token);heartbeat:Wait()end
                 check(token)
@@ -3731,8 +3362,7 @@ local function initializeRift()
     local recoverPendingWork
     local function workflow(token)
         recoverPendingWork(token)
-        local nextState=nil
-        while api.active or areaWatch.enabled or indexWatch.enabled do
+        while areaWatch.enabled or indexWatch.enabled do
             check(token)
             hatchQueue.refresh()
             if api.finishIndexIfComplete() then continue end
@@ -3741,96 +3371,12 @@ local function initializeRift()
             if nextFeature=="Event" then heartbeat:Wait();continue end
             if nextFeature=="Area" and runPriorityTrip(token) then continue end
             if nextFeature=="Index" and runIndexWork(token) then continue end
-            if areaWatch.enabled then watchMessage("WAITING  /  "..areaWatch.area.." / "..areaWatch.rarity..(api.active and " / The Rift is working" or " / watching new spawns")) end
-            if not api.active then
-                gui:SetAttribute("AutomationOwner",indexWatch.enabled and "Index" or "Area")
-                trainWhileWaiting(token,nil,{indexWatch.enabled and "Auto Index waits for missing species or hatches" or "Auto Area waits for matching eggs"})
-                continue
-            end
-            if reserveForRift() then
-                gui:SetAttribute("AutomationOwner","Area")
-                trainWhileWaiting(token,nil,{"Auto Area gets first pick after the field reset"})
-                continue
-            end
-            gui:SetAttribute("AutomationOwner","Rift")
-            local s=nextState or fetch();nextState=nil
-            check(token);updateUI()
-            if not acceptsBanner(s) and not s.PendingReward then
-                trainWhileWaiting(token,s,{"waiting for "..Rift.GetBannerDisplayName(wantedBanner).." banner; the server controls rotation"})
-                continue
-            end
-            if riftShouldYield() then continue end
-            assert(s.Unlocked==true,"The Rift needs "..compact(s.UnlockSpeedPower).." Speed")
-            assert(#s.Requirements==3,"The current Rift recipe is incomplete")
-            assert(not s.PendingReward,"A Rift reward is already pending. Claim it before starting.")
-            local inputs=selectInputs(s.Requirements,Save.Get())
-            if inputs[1] and inputs[2] and inputs[3] then
-                local receipt=trade(token,s)
-                if receipt then
-                    api.rounds+=1
-                    nextState=nextRecipe(token,receipt)
-                    updateUI()
-                    say("Next recipe","Completed "..api.rounds.." event eggs. Checking the next three pets.")
-                    pauseRift(token,.5)
-                end
-                continue
-            end
-            local action=false;local waiting={}
-            for i,category in ipairs(s.Requirements) do
-                if inputs[i] then continue end
-                if hatchQueue.pending(category) then
-                    table.insert(waiting,category.." hatching in background")
-                    continue
-                end
-                local eggs=ownedFor(category)
-                if eggs[1] then
-                    local entry=eggs[1]
-                    if not entry.egg.Placement then plant(token,entry.uid);action=true;break end
-                    if State.IsReadyToHatch(entry.uid) then hatch(token,entry);action=true;break end
-                    table.insert(waiting,category.." growing")
-                else
-                    local field=fieldsFor(category)
-                    if field[1] then
-                        local exitPoint=prepareDeparture(token)
-                        check(token)
-                        if riftShouldYield() then action=true;break end
-                        -- The field may reset while we step off the treadmill.
-                        field=fieldsFor(category)
-                        if not field[1] then action=true;break end
-                        local target,targetCycle=chooseFieldEgg(field)
-                        if not target then action=true;pause(token,.2);break end
-                        check(token)
-                        if liveState and signature(liveState)~=signature(s) then action=true;break end
-                        say("Collecting",category.." / "..target.AreaId.."; one egg, then return directly to the hatching space")
-                        local placement=placementPlan()
-                        runner.start(target.Uid,targetCycle,{
-                            destination=placement.position+Vector3.new(0,3,0),
-                            avoidZones=treadmillZones,
-                            exitPoint=exitPoint,
-                            priorityCheck=riftShouldYield,
-                        })
-                        while runner.active do check(token);heartbeat:Wait() end
-                        check(token)
-                        assert(runner.phase=="Complete" or runner.phase=="ResetWait" or runner.phase=="Yielded" or runner.phase=="Unavailable" or runner.phase=="RetryWait","Egg trip stopped: "..tostring(gui:GetAttribute("RunnerMessage")))
-                        if runner.phase=="RetryWait" then deferFieldEgg(target.Uid) end
-                        if runner.phase=="Complete" then
-                            local collectedUid=assert(runner.collectedUid,"Collected egg UID did not confirm")
-                            checkRiftPriority(token)
-                            plant(token,collectedUid,placement)
-                        end
-                        action=true;break
-                    end
-                    table.insert(waiting,category.." waiting for spawn")
-                end
-            end
-            if not action then trainWhileWaiting(token,s,waiting) end
+            if areaWatch.enabled then watchMessage("WAITING  /  "..areaWatch.area.." / "..areaWatch.rarity.." / watching new spawns") end
+            gui:SetAttribute("AutomationOwner",indexWatch.enabled and "Index" or "Area")
+            trainWhileWaiting(token,{indexWatch.enabled and "Auto Index waits for missing species or hatches" or "Auto Area waits for matching eggs"})
         end
     end
     local function finishWorkflow(token,ok,err)
-        if api.commitToken==token then
-            api.committing=false;api.commitToken=nil
-            if alive then gui:SetAttribute("RiftCommitting",false) end
-        end
         if token~=generation or not alive then return end
         if ok then return end
         local reason=tostring(err)
@@ -3844,7 +3390,7 @@ local function initializeRift()
         local left,leaveError=pcall(stopTraining,token)
         if not left then gui:SetAttribute("AutomationRecoveryReason",reason.." / "..tostring(leaveError)) end
         if token~=generation or not alive then return end
-        if api.active then say("Retrying",reason.." / Toggle stays ON; retrying after a short pause.") end
+        say("Retrying",reason.." / Toggle stays ON; retrying after a short pause.")
         if indexWatch.enabled then indexMessage("RETRYING / "..reason) end
         if areaWatch.enabled then watchMessage("RETRYING  /  "..reason.." / toggle stays ON") end
     end
@@ -3852,7 +3398,7 @@ local function initializeRift()
         generation+=1
         if runner.active then runner.stop(reason) end
         api.retryAt=os.clock()+2
-        if api.active then say("Waiting",reason.." / Will resume when the character is ready.") end
+        say("Waiting",reason.." / Will resume when the character is ready.")
         if indexWatch.enabled then indexMessage("WAITING / "..reason) end
         if areaWatch.enabled then watchMessage("WAITING  /  "..reason) end
     end
@@ -3866,26 +3412,6 @@ local function initializeRift()
             while runner.carriedReturnPoint() and os.clock()<deadline do pause(token,.1) end
             assert(not runner.carriedReturnPoint(),"Held egg inventory confirmation is still pending")
         end
-        local receipt=api.tradeRecovery
-        -- Collection features do not need a Rift request unless a sent trade is unfinished.
-        if not api.active and not receipt then return end
-        local s=fetch();check(token)
-        if s.PendingReward then
-            say("Claiming","Finishing the existing Rift reward before any new trade.")
-            local ok,value=pcall(function()return Remotes.Rift.AskFinishReveal:InvokeServer()end)
-            assert(ok and value~=false,"Pending Rift reward is not confirmed yet")
-            s=fetch();check(token)
-            assert(not s.PendingReward,"Waiting for the Rift claim to sync")
-        end
-        if receipt then
-            local save=Save.Get()
-            local count=(save.Rift.TradeInsByBanner or {})[receipt.banner] or 0
-            local consumed=true
-            for _,uid in ipairs(receipt.ids) do if save.Inventory[uid] then consumed=false;break end end
-            assert(count>receipt.beforeCount and consumed and not s.PendingReward,"Previous trade outcome is uncertain; waiting for confirmation, not sending another trade")
-            api.tradeRecovery=nil
-            configStore.request();configStore.flush()
-        end
     end
     local function automationReady()
         if player:GetAttribute("InBossArena") then return false end
@@ -3896,18 +3422,18 @@ local function initializeRift()
         local ok,ready=pcall(function()
             local save=Save.Get()
             local plot=Plot.ResolvePlot()
-            return type(save)=="table" and type(save.Inventory)=="table" and type(save.Rift)=="table"
+            return type(save)=="table" and type(save.Inventory)=="table"
                 and plot~=nil and plot.PetArea~=nil and plot.CenterPoint~=nil and plot.PlotFolder~=nil
                 and worldObject({"Areas","SeparationLine"})~=nil
         end)
         return ok and ready==true
     end
     ensureWorkflow=function()
-        if os.clock()<api.retryAt or restoringConfig or api.eventPaused or (eventController and eventController.busy) or manualStarting or schedulerRunning or not alive or not (api.active or areaWatch.enabled or indexWatch.enabled)
-            or runner.active or training.leaving or api.committing then return end
+        if os.clock()<api.retryAt or restoringConfig or api.eventPaused or (eventController and eventController.busy) or manualStarting or schedulerRunning or not alive or not (areaWatch.enabled or indexWatch.enabled)
+            or runner.active or training.leaving then return end
         if not automationReady() then
             gui:SetAttribute("AutomationWaitingForLoad",true)
-            if api.active then say("Loading","Waiting for your character, inventory and plot before resuming saved settings.") end
+            say("Loading","Waiting for your character, inventory and plot before resuming saved settings.")
             if indexWatch.enabled then indexMessage("LOADING / waiting for your character, inventory and plot") end
             if areaWatch.enabled then watchMessage("LOADING  /  waiting for your character, inventory and plot") end
             return
@@ -3926,12 +3452,12 @@ local function initializeRift()
             until false
             schedulerRunning=false
             if alive then gui:SetAttribute("AutomationOwner",nil) end
-            if alive and (api.active or areaWatch.enabled or indexWatch.enabled) then task.defer(ensureWorkflow) end
+            if alive and (areaWatch.enabled or indexWatch.enabled) then task.defer(ensureWorkflow) end
         end)
     end
     function api.collectOnce(uid)
         if api.eventPaused or (eventController and eventController.busy) then return end
-        if not alive or manualStarting or runner.active or api.active or api.committing or areaWatch.enabled or indexWatch.enabled then return end
+        if not alive or manualStarting or runner.active or areaWatch.enabled or indexWatch.enabled then return end
         if not automationReady() then
             runStatus.Text="LOADING";runDetail.Text="Wait for your character and plot to load, then click COLLECT.";return
         end
@@ -3957,13 +3483,9 @@ local function initializeRift()
     -- relinquish movement before the event controller can acquire it.
     function api.pauseForEvent(cancelled)
         api.eventPaused=true
-        if api.active then say("Event priority","Paused for DR Scramble; this toggle stays enabled.") end
+        say("Event priority","Paused for DR Scramble; collection toggles stay enabled.")
         if indexWatch.enabled then indexMessage("PAUSED / DR Scramble has priority") end
         if areaWatch.enabled then watchMessage("PAUSED  /  DR Scramble has priority") end
-        while api.committing do
-            if cancelled() then error("EVENT_CANCELLED",0) end
-            heartbeat:Wait()
-        end
         generation+=1
         if runner.active then runner.stop("Paused for DR Scramble") end
         while schedulerRunning or manualStarting do
@@ -3979,7 +3501,7 @@ local function initializeRift()
     function api.resumeAfterEvent()
         api.eventPaused=false
         if not alive then return end
-        if api.active then say("Checking","DR Scramble finished; resuming the current recipe.") end
+        say("Checking","DR Scramble finished; resuming collection.")
         if areaWatch.enabled then watchMessage("WAITING  /  checking your selected eggs") end
         task.defer(ensureWorkflow)
     end
@@ -3996,30 +3518,8 @@ local function initializeRift()
             watchMessage("OFF")
         end
     end
-    function api.start()
-        if api.eventPaused or (eventController and eventController.busy) then
-            api.active=true;switchOn(true)
-            say("Event priority","The Rift will resume after the drone round.")
-            return
-        end
-        if manualStarting then say("Busy","A manual collection is starting. Finish it before enabling The Rift.");return end
-        if api.active or api.committing or training.leaving then return end
-        if runner.active and not schedulerRunning then say("Busy","Finish or stop the manual egg trip before starting The Rift");return end
-        api.active=true;switchOn(true)
-        say("Checking",areaWatch.busy and "Auto Area is collecting; The Rift will follow." or "Reading your recipe and available pets")
-        ensureWorkflow()
-    end
-    connect(sw.Activated,function()
-        if api.active then
-            rememberToggle("rift",false)
-            api.stop("Stopped by toggle","Toggle")
-        else
-            rememberToggle("rift",true)
-            api.start()
-        end
-    end)
     connect(Input.InputBegan,function(input)
-        if not (api.active or areaWatch.enabled or areaWatch.busy or indexWatch.enabled or indexWatch.busy) or Input:GetFocusedTextBox() then return end
+        if not (areaWatch.enabled or areaWatch.busy or indexWatch.enabled or indexWatch.busy) or Input:GetFocusedTextBox() then return end
         local k=input.KeyCode
         if k==Enum.KeyCode.W or k==Enum.KeyCode.A or k==Enum.KeyCode.S or k==Enum.KeyCode.D or k==Enum.KeyCode.Escape
             or k==Enum.KeyCode.Up or k==Enum.KeyCode.Down or k==Enum.KeyCode.Left or k==Enum.KeyCode.Right then
@@ -4029,34 +3529,21 @@ local function initializeRift()
         end
     end)
     eventController=createScrambleController(eventPage)
-    switchOn(false);say("Ready","Continuous recipes: train on your treadmill while required eggs spawn or grow.")
-    connect(Save.FieldSignal("Rift"),function()recipeDirty=true end)
+    say("Ready","Collection ready; train on your treadmill while selected eggs spawn or grow.")
     task.spawn(function()
-        local nextRender=0
-            while alive do
+        while alive do
             hatchQueue.refresh()
             if indexPage.Visible and panel.Visible then
                 local ok,data=pcall(indexScan,false)
                 if ok then paintIndex(data) else indexMessage("WAITING / Index data unavailable") end
             end
             ensureWorkflow()
-            if not fetching and (recipeDirty or os.clock()-lastFetch>=5) then
-                local ok,err=pcall(fetch)
-                if not ok and alive then
-                    if not api.active then say("Unavailable",tostring(err)) else warn("RIFT_STATE_REFRESH",err) end
-                    task.wait(1)
-                end
-            end
-            if alive and os.clock()>=nextRender then
-                nextRender=os.clock()+1
-                requestRiftRefresh()
-            end
             task.wait(.25)
         end
     end)
 end
 
-initializeRift()
+initializeAutomation()
 
 -- Attach persistence only after all settings have been restored and the UI is ready.
 do
@@ -4070,18 +3557,16 @@ do
             rules=areaWatch.rules,editingArea=areaWatch.editing,
             selectedArea=selected,search=search.Text,tab=gui:GetAttribute("ActiveTab"),
             position={x=panel.Position.X.Offset,y=panel.Position.Y.Offset},
-            autoArea=togglePreference.autoArea,rift=togglePreference.rift,autoEvent=togglePreference.autoEvent,autoIndex=togglePreference.autoIndex,indexAreas=indexWatch.areas,
+            autoArea=togglePreference.autoArea,autoEvent=togglePreference.autoEvent,autoIndex=togglePreference.autoIndex,indexAreas=indexWatch.areas,
             indexTargets=indexWatch.options.targets,indexStrategy=indexWatch.options.strategy,indexCompletion=indexWatch.options.completion,
             priorityOrder=table.clone(priorities.order),
             notifications=gui:GetAttribute("NotificationsEnabled")~=false,
-            pendingRiftTrade=riftController and riftController.tradeRecovery or nil,
-            riftBanner=gui:GetAttribute("RiftWantedBanner"),
         }
     end)
-    -- Restore both switches before the shared scheduler can start either feature.
+    if retiredConfig then configStore.request();configStore.flush() end
+    -- Restore saved switches before the shared scheduler can start any feature.
     if togglePreference.autoArea and setWatchEnabled then setWatchEnabled(true) end
-    if togglePreference.autoIndex and riftController then riftController.setIndexEnabled(true) end
-    if togglePreference.rift and riftController then riftController.start() end
+    if togglePreference.autoIndex and automationController then automationController.setIndexEnabled(true) end
     if togglePreference.autoEvent and eventController then eventController.setEnabled(true) end
     restoringConfig=false
     connect(player.OnTeleport,function()configStore.request();configStore.flush()end)
